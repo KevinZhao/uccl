@@ -492,12 +492,43 @@ class Buffer:
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         if overlap:
-            raise NotImplementedError(
-                "low_latency_combine(overlap=True) is not implemented yet. "
-                "The overlap/comp_signal/src_signals kwargs are accepted for API compatibility "
-                "with DeepEP and SGLang SBO callers; enabling the overlap kernel path requires "
-                "changes to internode_ll::combine() that will land in a follow-up PR."
-            )
+            # Hopper SBO path: require DeepGemm-produced comp_signal tensors.
+            # The Blackwell src_signals path is reserved for a later PR — the
+            # C++ side will throw runtime_error if its pointer is supplied.
+            if not return_recv_hook:
+                raise ValueError(
+                    "low_latency_combine(overlap=True) requires return_recv_hook=True "
+                    "to separate SEND and RECV phases; the SEND-phase GPU spin on "
+                    "comp_signal would deadlock otherwise."
+                )
+            if async_finish:
+                raise ValueError(
+                    "low_latency_combine(overlap=True) and async_finish=True are "
+                    "mutually exclusive (async_finish + return_recv_hook is already "
+                    "disallowed)."
+                )
+            if packed_recv_count is None:
+                raise ValueError(
+                    "overlap=True requires packed_recv_count (int32 tensor of length "
+                    "num_local_experts, returned from low_latency_dispatch)."
+                )
+            if packed_recv_count.dtype != torch.int32:
+                raise ValueError("packed_recv_count must be torch.int32")
+            if comp_signal is None:
+                raise ValueError(
+                    "overlap=True requires comp_signal (int32 tensor of length "
+                    "num_local_experts * ceil(num_max_dispatch_tokens_per_rank*num_ranks / block_m))."
+                )
+            if comp_signal.dtype != torch.int32:
+                raise ValueError("comp_signal must be torch.int32")
+            if block_m not in (64, 128):
+                raise ValueError(f"block_m must be 64 or 128, got {block_m}")
+            if threshold < 1:
+                raise ValueError(f"threshold must be >= 1, got {threshold}")
+            if packed_recv_count.device != x.device or comp_signal.device != x.device:
+                raise ValueError(
+                    "packed_recv_count / comp_signal must live on x.device"
+                )
         (
             src_info,
             layout_range,
@@ -548,6 +579,14 @@ class Buffer:
             bool(async_finish),
             bool(return_recv_hook),
             combined_x.data_ptr(),
+            bool(overlap),
+            packed_recv_count.data_ptr() if packed_recv_count is not None else 0,
+            comp_signal.data_ptr() if comp_signal is not None else 0,
+            int(block_m),
+            int(threshold),
+            int(num_sms),
+            src_signals.data_ptr() if src_signals is not None else 0,
+            int(src_signal_expect_value),
         )
         tensors_to_record = (
             x_for_combine,
