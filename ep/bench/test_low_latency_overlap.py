@@ -149,6 +149,45 @@ def run_combine(
     return combined_x
 
 
+def test_baseline_vs_baseline_control(
+    buffer: Buffer, dispatch_out, num_ranks: int, args, device: torch.device
+):
+    """Control test: run overlap=False twice with the same input. Any diff
+    between out_ref1 and out_ref2 proves the buffer-swap / ring-buffer state
+    itself is not bit-stable across back-to-back combine calls, which would
+    invalidate the bit-exact assumption in the next test."""
+    recv_x, recv_count, handle, _, _ = dispatch_out
+    rx_ref = recv_x[0] if isinstance(recv_x, tuple) else recv_x
+    simulated_gemm_x = torch.randn(rx_ref.shape, dtype=torch.bfloat16, device=device)
+    _, topk_idx, topk_weights = make_dispatch_inputs(
+        dist.get_rank(),
+        dist.get_world_size(),
+        args.num_tokens,
+        args.hidden,
+        args.num_topk,
+        args.num_experts,
+        device,
+    )
+    out_a = run_combine(
+        buffer, simulated_gemm_x, topk_idx, topk_weights, handle, overlap=False
+    )
+    out_b = run_combine(
+        buffer, simulated_gemm_x, topk_idx, topk_weights, handle, overlap=False
+    )
+    if not torch.allclose(out_a.float(), out_b.float(), rtol=0, atol=0):
+        diff = (out_a.float() - out_b.float()).abs().max().item()
+        print(
+            f"[rank {dist.get_rank()}] CONTROL: two baseline combine calls differ "
+            f"max abs = {diff} -- bit-exact test is INVALID",
+            flush=True,
+        )
+    else:
+        print(
+            f"[rank {dist.get_rank()}] control baseline-vs-baseline: OK (bit-stable)",
+            flush=True,
+        )
+
+
 def test_overlap_bit_exact_vs_baseline(
     buffer: Buffer, dispatch_out, num_ranks: int, args, device: torch.device
 ):
@@ -501,6 +540,7 @@ def main():
     dispatch_out = (recv_x, recv_count, handle, event, hook)
 
     for fn in (
+        test_baseline_vs_baseline_control,
         test_overlap_bit_exact_vs_baseline,
         test_overlap_signal_wait,
         test_overlap_zero_token_expert,
