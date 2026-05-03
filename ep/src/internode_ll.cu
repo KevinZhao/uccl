@@ -879,6 +879,15 @@ __global__ __launch_bounds__(1024, 1) void combine(
     EP_STATIC_ASSERT(kNumUnrolls * kNumStages <= 12,
                      "TMA buffer size exceed limit");
 
+    // SM-stripe: drain any TMA prefetches left pending from the previous
+    // iteration so they cannot arrive at the newly-reset mbarriers below
+    // and flip phase parity out of sync with our register tma_phase[].
+    // No-op on the first iteration (nothing in flight).
+    if constexpr (kOverlap) {
+      asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+      __syncwarp();
+    }
+
     // Initialize m-barriers
     if (lane_id < kNumStages) {
       mbarrier_init(tma_mbarrier[lane_id], 1);
@@ -1124,6 +1133,14 @@ __global__ __launch_bounds__(1024, 1) void combine(
       atomic_add_release_global<kUseAggressiveAtomic>(atomic_clean_flag, -1);
     }
     __syncwarp();
+    // SM-stripe: CTA fence between iterations so that the single finish-flag
+    // writer warp has committed its IBGDA atomic add and the atomic_clean_flag
+    // decrement is visible before other warps start re-initializing
+    // mbarriers. Legacy path only executes one iteration, so __syncwarp()
+    // was enough — under SM-stripe we need the full-CTA barrier.
+    if constexpr (kOverlap) {
+      __syncthreads();
+    }
   }
 
 // Receiving phase
