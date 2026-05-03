@@ -144,10 +144,16 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["baseline", "overlap", "both"],
+        choices=["baseline", "overlap", "both", "sweep"],
         default="both",
     )
     parser.add_argument("--num-sms", type=int, default=3)
+    parser.add_argument(
+        "--sweep-sms",
+        type=str,
+        default="3,6,8,12,16,24,32",
+        help="Comma-separated num_sms values to sweep in --mode=sweep",
+    )
     args = parser.parse_args()
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -170,15 +176,15 @@ def main():
         rank, args.num_tokens, args.hidden, args.num_topk, args.num_experts, device
     )
 
-    modes = (
-        [("baseline", False, args.num_experts)]  # overlap=False picks its own num_sms
-        if args.mode == "baseline"
-        else (
-            [("overlap", True, args.num_sms)]
-            if args.mode == "overlap"
-            else [("baseline", False, 0), ("overlap", True, args.num_sms)]
-        )
-    )
+    if args.mode == "baseline":
+        modes = [("baseline", False, 0)]
+    elif args.mode == "overlap":
+        modes = [("overlap", True, args.num_sms)]
+    elif args.mode == "sweep":
+        sweep = [int(x) for x in args.sweep_sms.split(",") if x.strip()]
+        modes = [("baseline", False, 0)] + [(f"overlap-{n}", True, n) for n in sweep]
+    else:
+        modes = [("baseline", False, 0), ("overlap", True, args.num_sms)]
 
     for iteration in range(args.num_iters):
         for mode_name, overlap, num_sms_arg in modes:
