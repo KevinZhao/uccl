@@ -585,6 +585,30 @@ void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
   S.numa_node = uccl::get_dev_numa_node(selected_nic_name.c_str());
   printf("[RDMA] Selected NIC %s (index %d) for GPU %d, NUMA node %d\n",
          selected_nic_name.c_str(), selected_dev_idx, gpu_idx, S.numa_node);
+#ifdef EFA
+  // Informational: dump EFA vendor device caps. Gated by
+  // UCCL_EP_EFA_CAPS_DUMP=1 so production runs stay silent. No runtime
+  // behavior change; output goes to stderr for easy capture.
+  if (char const* dump_env = std::getenv("UCCL_EP_EFA_CAPS_DUMP");
+      dump_env && std::atoi(dump_env) > 0) {
+    struct efadv_device_attr efa_attr = {};
+    int rc = efadv_query_device(S.context, &efa_attr,
+                                sizeof(struct efadv_device_attr));
+    if (rc == 0) {
+      fprintf(stderr,
+              "[EFA caps] nic=%s gpu=%d max_sq_wr=%u max_rq_wr=%u "
+              "max_sq_sge=%u max_rq_sge=%u inline_buf_size=%u "
+              "max_rdma_size=%u device_caps=0x%x\n",
+              selected_nic_name.c_str(), gpu_idx, efa_attr.max_sq_wr,
+              efa_attr.max_rq_wr, efa_attr.max_sq_sge, efa_attr.max_rq_sge,
+              efa_attr.inline_buf_size, efa_attr.max_rdma_size,
+              efa_attr.device_caps);
+    } else {
+      fprintf(stderr, "[EFA caps] nic=%s gpu=%d efadv_query_device rc=%d\n",
+              selected_nic_name.c_str(), gpu_idx, rc);
+    }
+  }
+#endif
   ibv_free_device_list(dev_list);
   S.pd = ibv_alloc_pd(S.context);
   if (!S.pd) {
