@@ -731,7 +731,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 }
 
 template <bool kUseLogFMT, int kHidden, int kNumMaxTopk,
-          bool kUseAggressiveAtomic>
+          bool kUseAggressiveAtomic, bool kOverlap = false>
 __global__ __launch_bounds__(1024, 1) void combine(
     void* combined_x, void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
     void const* x, int64_t const* topk_idx, float const* topk_weights,
@@ -746,7 +746,10 @@ __global__ __launch_bounds__(1024, 1) void combine(
     void** ipc_rdma_base_ptrs = nullptr, void* rdma_buffer_ptr = nullptr,
     void* atomic_buffer_ptr = nullptr,
     int64_t* rdma_recv_flag_internode = nullptr,
-    int* grid_sync_barrier_ptr = nullptr) {
+    int* grid_sync_barrier_ptr = nullptr,
+    int const* packed_recv_count = nullptr, int const* comp_signal = nullptr,
+    int block_m = 64, int threshold = 0,
+    int* finish_counter_per_expert = nullptr) {
   auto const sm_id = static_cast<int>(blockIdx.x);
   auto const num_sms = static_cast<int>(gridDim.x);
   auto const thread_id = static_cast<int>(threadIdx.x);
@@ -771,6 +774,19 @@ __global__ __launch_bounds__(1024, 1) void combine(
   EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0,
                    "Invalid vectorization");
 
+  // SM-stripe scheduling parameters. In non-overlap mode we run one iteration
+  // with the classic `responsible_expert_idx = sm_id * num_warp_groups +
+  // warp_group_id` mapping; overlap mode strides with num_sms (SGLang SBO
+  // picks a small budget, default 3). Declared before the first goto so that
+  // nvcc accepts the downward branch past their initialization.
+  int const slot_start =
+      kOverlap ? sm_id : (sm_id * num_warp_groups + warp_group_id);
+  int const slot_stride = kOverlap ? num_sms : num_experts;  // legacy: 1 iter
+  int const max_blocks_per_expert =
+      kOverlap ? (num_max_dispatch_tokens_per_rank * num_ranks + block_m - 1) /
+                     block_m
+               : 0;
+
   // Sending phase
   if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_COMBINE_RECV;
 
@@ -789,11 +805,42 @@ __global__ __launch_bounds__(1024, 1) void combine(
                                                       num_experts);
   }
 
-  // Issue IBGDA sends
-  if (responsible_expert_idx < num_experts) {
-    auto const dst_rank = responsible_expert_idx / num_local_experts;
-    auto const local_expert_idx = responsible_expert_idx % num_local_experts;
+  for (int send_slot_idx = slot_start; send_slot_idx < num_experts;
+       send_slot_idx += slot_stride) {
+    auto const dst_rank = send_slot_idx / num_local_experts;
+    auto const local_expert_idx = send_slot_idx % num_local_experts;
     auto const global_expert_idx = rank * num_local_experts + local_expert_idx;
+
+    // SBO overlap: before touching TMA/mbarrier for this slot, block the
+    // whole SEND stripe until DeepGemm has produced enough down-gemm output
+    // tiles for this local expert. Signal semantics:
+    //   comp_signal[local_expert * max_blocks_per_expert + last_block] counts
+    //   how many down_gemm N-tiles of that M-block have completed. Waiting
+    //   for the LAST needed M-block of the expert is sufficient because
+    //   DeepGemm produces M-blocks in monotonic order.
+    if constexpr (kOverlap) {
+      int const rx_count = __ldg(packed_recv_count + local_expert_idx);
+      if (rx_count > 0 && threshold > 0) {
+        int const num_blocks = (rx_count + block_m - 1) / block_m;
+        int const signal_idx =
+            local_expert_idx * max_blocks_per_expert + (num_blocks - 1);
+        if (warp_id == 0 && lane_id == 0) {
+#if defined(__NVCC__) && !defined(DISABLE_SM90_FEATURES)
+          while (ld_acquire_global<kUseAggressiveAtomic>(
+                     comp_signal + signal_idx) < threshold) {
+            __nanosleep(100);
+          }
+#else
+          while (ld_acquire_global<kUseAggressiveAtomic>(
+                     comp_signal + signal_idx) < threshold) {
+            ;
+          }
+#endif
+        }
+        __syncthreads();
+      }
+    }
+
     auto const layout =
         __ldg(layout_range + local_expert_idx * num_ranks + dst_rank);
     auto const local_x =
@@ -1216,20 +1263,64 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              int num_d2h_channel_addrs, int max_nvl_peers,
              int low_latency_buffer_idx, void** ipc_rdma_base_ptrs,
              void* rdma_buffer_ptr, void* atomic_buffer_ptr,
-             int64_t* rdma_recv_flag_internode) {
+             int64_t* rdma_recv_flag_internode, bool overlap,
+             int const* packed_recv_count, int const* comp_signal, int block_m,
+             int threshold, int num_sms_override) {
   constexpr int kNumMaxTopk = 9;
-  int const num_warp_groups = ceil_div(num_experts, num_device_sms);
-  int const num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
+  int const num_local_experts = num_experts / num_ranks;
+
+  // Scheduler decision. Two valid regimes:
+  //   * Legacy: each SM owns a contiguous slice of responsible_expert_idx via
+  //     `sm_id * num_warp_groups + warp_group_id`. Grid is sized so that
+  //     num_sms * num_warp_groups == num_experts.
+  //   * SEND-overlap: SGLang restricts the SEND kernel to a small SM budget
+  //     (default 3 on Hopper per deepep.py:717). Each SM strides over
+  //     responsible_expert_idx with stride=num_sms.
+  //
+  // The RECV phase is always launched with the legacy config regardless of
+  // overlap — `return_recv_hook=true` makes RECV a separate kernel call, and
+  // RECV semantics require every responsible_expert_idx to be handled by
+  // exactly one warp-group.
+  bool const send_overlap = overlap && (phases & LOW_LATENCY_SEND_PHASE) != 0 &&
+                            (phases & LOW_LATENCY_RECV_PHASE) == 0;
+  int num_warp_groups;
+  int num_warps_per_group;
+  int num_sms;
+  if (send_overlap) {
+    num_sms = (num_sms_override > 0) ? num_sms_override : 3;
+    num_warp_groups = 1;
+    num_warps_per_group = kNumMaxWarpGroups;
+  } else {
+    num_warp_groups = ceil_div(num_experts, num_device_sms);
+    num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
+    num_sms = ceil_div(num_experts, num_warp_groups);
+  }
   EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0);
 
   auto const num_warps = num_warp_groups * num_warps_per_group;
-  auto const num_sms = ceil_div(num_experts, num_warp_groups);
 
-  // Check workspace
+  // Check workspace. In overlap mode we additionally carve out a
+  // per-local-expert finish counter so that the last SM to drain an expert
+  // can fire its finish flag exactly once.
   auto atomic_clean_flag = static_cast<int*>(workspace);
   auto grid_sync_barrier_ptr = atomic_clean_flag + 1;
-  EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
+  auto finish_counter_per_expert = grid_sync_barrier_ptr + 1;
+  EP_HOST_ASSERT(static_cast<std::size_t>(2 + num_local_experts) *
+                     sizeof(int) <=
+                 NUM_WORKSPACE_BYTES);
   EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
+
+  if (overlap) {
+    EP_HOST_ASSERT(packed_recv_count != nullptr);
+    EP_HOST_ASSERT(comp_signal != nullptr);
+    EP_HOST_ASSERT(block_m == 64 || block_m == 128);
+    EP_HOST_ASSERT(threshold >= 1);
+  } else {
+    (void)packed_recv_count;
+    (void)comp_signal;
+    (void)block_m;
+    (void)threshold;
+  }
 
   // Online cast cannot use zero-copy
   EP_HOST_ASSERT(not(zero_copy and use_logfmt));
@@ -1267,26 +1358,33 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
 
   static bool const aggressive_atomic_enabled = get_aggressive_atomic_enabled();
 
-#define COMBINE_LAUNCH_CASE(hidden)                                          \
-  {                                                                          \
-    auto combine_func =                                                      \
-        aggressive_atomic_enabled                                            \
-            ? (use_logfmt ? combine<true, hidden, kNumMaxTopk, true>         \
-                          : combine<false, hidden, kNumMaxTopk, true>)       \
-            : (use_logfmt ? combine<true, hidden, kNumMaxTopk, false>        \
-                          : combine<false, hidden, kNumMaxTopk, false>);     \
-    SET_SHARED_MEMORY_FOR_TMA(combine_func);                                 \
-    LAUNCH_KERNEL(                                                           \
-        &cfg, combine_func, combined_x, rdma_recv_x, rdma_recv_flag,         \
-        rdma_send_x, x, topk_idx, topk_weights, src_info, layout_range,      \
-        combine_wait_recv_cost_stats, next_clean, next_clean_second,         \
-        num_next_clean_int, atomic_clean_flag, num_combined_tokens, hidden,  \
-        num_topk, num_max_dispatch_tokens_per_rank, num_experts, rank,       \
-        num_ranks, num_warp_groups, num_warps_per_group_launch, phases,      \
-        zero_copy, d2h_channel_addrs, num_d2h_channel_addrs, max_nvl_peers,  \
-        low_latency_buffer_idx, ipc_rdma_base_ptrs, rdma_buffer_ptr,         \
-        atomic_buffer_ptr, rdma_recv_flag_internode, grid_sync_barrier_ptr); \
-  }                                                                          \
+#define COMBINE_PICK_FUNC(hidden, agg, overlap_bool)                  \
+  (use_logfmt ? combine<true, hidden, kNumMaxTopk, agg, overlap_bool> \
+              : combine<false, hidden, kNumMaxTopk, agg, overlap_bool>)
+
+#define COMBINE_LAUNCH_CASE(hidden)                                            \
+  {                                                                            \
+    auto combine_func = send_overlap                                           \
+                            ? (aggressive_atomic_enabled                       \
+                                   ? COMBINE_PICK_FUNC(hidden, true, true)     \
+                                   : COMBINE_PICK_FUNC(hidden, false, true))   \
+                            : (aggressive_atomic_enabled                       \
+                                   ? COMBINE_PICK_FUNC(hidden, true, false)    \
+                                   : COMBINE_PICK_FUNC(hidden, false, false)); \
+    SET_SHARED_MEMORY_FOR_TMA(combine_func);                                   \
+    LAUNCH_KERNEL(                                                             \
+        &cfg, combine_func, combined_x, rdma_recv_x, rdma_recv_flag,           \
+        rdma_send_x, x, topk_idx, topk_weights, src_info, layout_range,        \
+        combine_wait_recv_cost_stats, next_clean, next_clean_second,           \
+        num_next_clean_int, atomic_clean_flag, num_combined_tokens, hidden,    \
+        num_topk, num_max_dispatch_tokens_per_rank, num_experts, rank,         \
+        num_ranks, num_warp_groups, num_warps_per_group_launch, phases,        \
+        zero_copy, d2h_channel_addrs, num_d2h_channel_addrs, max_nvl_peers,    \
+        low_latency_buffer_idx, ipc_rdma_base_ptrs, rdma_buffer_ptr,           \
+        atomic_buffer_ptr, rdma_recv_flag_internode, grid_sync_barrier_ptr,    \
+        packed_recv_count, comp_signal, block_m, threshold,                    \
+        finish_counter_per_expert);                                            \
+  }                                                                            \
   break
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
@@ -1301,6 +1399,7 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
     fflush(stdout);
   }
 #undef COMBINE_LAUNCH_CASE
+#undef COMBINE_PICK_FUNC
 }
 
 }  // namespace internode_ll

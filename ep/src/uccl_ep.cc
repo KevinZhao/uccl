@@ -1284,11 +1284,13 @@ class Buffer {
   }
 
   // `low_latency_combine` accepts seven DeepEP-compatible overlap kwargs at
-  // the end of the argument list. They are parsed for API compatibility with
-  // SGLang SBO callers (deepep.py:680-693, which dispatches to different
-  // kwargs dicts on Hopper vs Blackwell paths). Only `overlap=false` is
-  // wired to a kernel path today; `overlap=true` is rejected below until the
-  // comp_signal / src_signals kernel variants land in a follow-up PR.
+  // the end of the argument list, matching SGLang SBO call sites on both
+  // Hopper (`comp_signal`) and Blackwell (`src_signals`) paths. When
+  // `overlap == false` the legacy kernel runs unchanged. When `overlap ==
+  // true` the Hopper variant (SM-stripe scheduler spinning on
+  // `ld.acquire.gpu.global.s32 comp_signal >= threshold`) is invoked via the
+  // `kOverlap=true` template instantiation. The Blackwell `src_signals` path
+  // is reserved for a later PR — we reject its activation here.
   std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
   low_latency_combine(
       std::uintptr_t x_ptr, int x_dim0, int x_dim1, int x_dim2,
@@ -1309,18 +1311,30 @@ class Buffer {
     EP_HOST_ASSERT(src_info_ptr != 0 && layout_range_ptr != 0);
     EP_HOST_ASSERT(out_ptr != 0);
     if (overlap) {
-      throw std::runtime_error(
-          "low_latency_combine(overlap=true) is not implemented yet. "
-          "Overlap kernel support (comp_signal / src_signals) will land in a "
-          "follow-up PR; this release only accepts the parameters for API "
-          "compatibility with DeepEP and SGLang SBO callers.");
+      // Hopper SBO path activation. Require the Hopper-specific tensors +
+      // scalars; reject Blackwell path (src_signals) for Sprint A.
+      EP_HOST_ASSERT(packed_recv_count_ptr != 0);
+      EP_HOST_ASSERT(comp_signal_ptr != 0);
+      EP_HOST_ASSERT(block_m == 64 || block_m == 128);
+      EP_HOST_ASSERT(threshold >= 1);
+      // GPU spin lives in the SEND-phase kernel; it would deadlock a combined
+      // SEND+RECV launch. Force separate launches via return_recv_hook=true.
+      EP_HOST_ASSERT(return_recv_hook);
+      EP_HOST_ASSERT(!async);
+      EP_HOST_ASSERT(num_sms >= 0);
+      if (src_signals_ptr != 0) {
+        throw std::runtime_error(
+            "low_latency_combine(overlap=true, src_signals=...) is the "
+            "Blackwell variant and is not implemented yet. Use Hopper "
+            "comp_signal instead, or wait for the Blackwell follow-up PR.");
+      }
+      // src_signal_expect_value is Blackwell-only; ignore silently when 0.
+    } else {
+      // Guard against stale overlap-mode pointers leaking into the legacy
+      // path. Defaults keep this invariant for unaware callers.
+      EP_HOST_ASSERT(packed_recv_count_ptr == 0);
+      EP_HOST_ASSERT(comp_signal_ptr == 0);
     }
-    // Silence unused-variable warnings for stub parameters.
-    (void)packed_recv_count_ptr;
-    (void)comp_signal_ptr;
-    (void)block_m;
-    (void)threshold;
-    (void)num_sms;
     (void)src_signals_ptr;
     (void)src_signal_expect_value;
 
@@ -1364,6 +1378,10 @@ class Buffer {
             ? nullptr
             : reinterpret_cast<int64_t*>(combine_wait_recv_cost_stats_ptr);
     void* out = reinterpret_cast<void*>(out_ptr);
+    int* packed_recv_count =
+        overlap ? reinterpret_cast<int*>(packed_recv_count_ptr) : nullptr;
+    int* comp_signal =
+        overlap ? reinterpret_cast<int*>(comp_signal_ptr) : nullptr;
 
     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
@@ -1377,7 +1395,8 @@ class Buffer {
           num_device_sms, launch_stream, phases, zero_copy, d_handles,
           num_d2h_channel_addrs, max_nvl_peers, low_latency_buffer_idx_used,
           d_ipc_rdma_base_ptrs, rdma_buffer_ptr, atomic_buffer_ptr,
-          buffer.combine_rdma_recv_flag_buffer_internode);
+          buffer.combine_rdma_recv_flag_buffer_internode, overlap,
+          packed_recv_count, comp_signal, block_m, threshold, num_sms);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE

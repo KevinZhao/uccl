@@ -42,6 +42,9 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              int num_d2h_channel_addrs, int max_nvl_peers,
              int low_latency_buffer_idx, void** ipc_rdma_base_ptrs = nullptr,
              void* rdma_buffer_ptr = nullptr, void* atomic_buffer_ptr = nullptr,
-             int64_t* rdma_recv_flag_internode = nullptr);
+             int64_t* rdma_recv_flag_internode = nullptr, bool overlap = false,
+             int const* packed_recv_count = nullptr,
+             int const* comp_signal = nullptr, int block_m = 64,
+             int threshold = 0, int num_sms_override = 0);
 }  // namespace internode_ll
 }  // namespace uccl
