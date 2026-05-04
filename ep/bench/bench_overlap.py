@@ -66,6 +66,119 @@ def _report(msg: str):
     sys.stderr.flush()
 
 
+def _alloc_probe_buffer(device):
+    """Allocate a uint8 CUDA buffer sized exactly for ProbeBuffer.
+
+    Returns (buffer_tensor, None) when the extension was built without
+    -DUCCL_EP_PROBE; caller must skip probe capture in that case.
+    """
+    if not hasattr(ep, "probe_buffer_bytes"):
+        return None, None
+    n_bytes = ep.probe_buffer_bytes()
+    buf = torch.zeros(n_bytes, dtype=torch.uint8, device=device)
+    return buf, n_bytes
+
+
+def _parse_probe_buffer(buf: torch.Tensor) -> dict:
+    """Reinterpret the raw uint8 probe buffer into the ProbeBuffer layout.
+
+    Layout must stay in sync with combine_probe.cuh: sm_start[kMaxSMs],
+    sm_end[kMaxSMs], slot_start[kMaxSMs][kMaxSlotsPerSM], slot_end[...],
+    put_start[...], put_end[...], n_slots[kMaxSMs], pad[3].
+    All timestamp fields are uint64; n_slots is int32.
+    """
+    max_sms = ep.probe_buffer_max_sms()
+    max_slots = ep.probe_buffer_max_slots_per_sm()
+    host = buf.cpu()
+    offset = 0
+
+    def take_u64(count):
+        nonlocal offset
+        view = host[offset : offset + count * 8].view(torch.int64)
+        offset += count * 8
+        return view.numpy().astype("int64")
+
+    def take_i32(count):
+        nonlocal offset
+        view = host[offset : offset + count * 4].view(torch.int32)
+        offset += count * 4
+        return view.numpy().astype("int32")
+
+    sm_start = take_u64(max_sms)
+    sm_end = take_u64(max_sms)
+    slot_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    slot_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    put_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    put_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    n_slots = take_i32(max_sms)
+    return dict(
+        sm_start=sm_start,
+        sm_end=sm_end,
+        slot_start=slot_start,
+        slot_end=slot_end,
+        put_start=put_start,
+        put_end=put_end,
+        n_slots=n_slots,
+    )
+
+
+def _probe_summary(probes: list, sm_clock_khz: int) -> dict:
+    """Aggregate per-iter probes into per-mechanism statistics (µs).
+
+    Conventions:
+      - Only clock64 deltas within the same SM are meaningful (different SMs
+        may run at different frequencies, and the clock is not globally
+        synchronized). We never subtract across SMs.
+      - sm_clock_khz is the device boost clockRate from cudaDeviceProp
+        (already in kHz), so cycles / sm_clock_khz / 1000 → µs.
+      - n_slots[sm] may be 0 for SMs that the grid didn't spin up (rare)
+        or when UCCL_EP_PROBE was compiled out — caller must check.
+
+    Returns dict with keys T_slot, T_put, T_sm each mapping to a list of
+    values (µs) across all (iter, sm, slot) samples; caller computes CDF.
+    """
+    T_slot = []  # D-2: slot_end - slot_start (whole slot wall-time)
+    T_put = []  # D-1: put_end - put_start (IBGDA NIC window)
+    T_sm = []  # D-4: sm_end - sm_start (per-SM total)
+    for p in probes:
+        n_slots = p["n_slots"]
+        max_sms = len(n_slots)
+        for sm in range(max_sms):
+            n = int(n_slots[sm])
+            if n <= 0:
+                continue
+            sm_delta = int(p["sm_end"][sm]) - int(p["sm_start"][sm])
+            if sm_delta > 0:
+                T_sm.append(sm_delta)
+            for slot in range(min(n, p["slot_start"].shape[1])):
+                slot_delta = int(p["slot_end"][sm, slot]) - int(
+                    p["slot_start"][sm, slot]
+                )
+                if slot_delta > 0:
+                    T_slot.append(slot_delta)
+                ps = int(p["put_start"][sm, slot])
+                pe = int(p["put_end"][sm, slot])
+                if ps > 0 and pe > ps:
+                    T_put.append(pe - ps)
+    cycles_to_us = 1.0 / (sm_clock_khz * 1000.0) * 1e6
+
+    def stats(arr):
+        if not arr:
+            return None
+        a = np.asarray(arr, dtype=np.int64) * cycles_to_us
+        return dict(
+            n=len(a),
+            mean=float(a.mean()),
+            p50=float(np.percentile(a, 50)),
+            p99=float(np.percentile(a, 99)),
+            p999=float(np.percentile(a, 99.9)),
+            max=float(a.max()),
+            stdev=float(a.std()),
+        )
+
+    return dict(T_slot=stats(T_slot), T_put=stats(T_put), T_sm=stats(T_sm))
+
+
 def build_inputs(rank, num_tokens, hidden, num_topk, num_experts, device):
     g = torch.Generator(device=device).manual_seed(42 + rank)
     x = torch.randn(
@@ -163,6 +276,97 @@ def run_mode_one(
     )
 
 
+def run_probe_one(
+    buffer,
+    x,
+    topk_idx,
+    topk_weights,
+    num_tokens,
+    num_experts,
+    num_sms,
+    num_iters,
+    block_m=64,
+    threshold=1,
+):
+    """Run combine(overlap=True) num_iters times with a probe buffer attached.
+
+    Returns a list of per-iter parsed ProbeBuffer dicts. Caller is expected
+    to aggregate across iters (and across ranks via torch.distributed). The
+    combine wall-time per iter is NOT measured here — use --mode=workload
+    for latency numbers; probe mode is strictly for mechanism attribution.
+    """
+    if not hasattr(ep, "probe_buffer_bytes"):
+        raise RuntimeError(
+            "probe buffer API not available — rebuild uccl.ep with "
+            "UCCL_EP_PROBE=1 python3 setup.py install"
+        )
+    if not ep.probe_buffer_enabled():
+        raise RuntimeError(
+            "probe compiled out (UCCL_EP_PROBE not defined at build time)"
+        )
+
+    recv_x, recv_count, handle, _, _ = buffer.low_latency_dispatch(
+        x,
+        topk_idx,
+        num_tokens,
+        num_experts,
+        use_fp8=True,
+        async_finish=False,
+        return_recv_hook=False,
+    )
+    rx_ref = recv_x[0] if isinstance(recv_x, tuple) else recv_x
+    simulated_gemm_x = torch.ones(rx_ref.shape, dtype=torch.bfloat16, device=x.device)
+    num_local_experts = num_experts // dist.get_world_size()
+    comp_signal = make_comp_signal(
+        num_local_experts,
+        num_tokens * dist.get_world_size(),
+        block_m,
+        x.device,
+        threshold,
+    )
+    packed_recv_count = recv_count.to(torch.int32)
+
+    probe_buf, _ = _alloc_probe_buffer(x.device)
+    probes = []
+    # 3 warmup calls to settle NIC state, then num_iters captured.
+    for warmup in range(3):
+        combined_x, event, hook = buffer.low_latency_combine(
+            simulated_gemm_x,
+            topk_idx,
+            topk_weights,
+            handle,
+            return_recv_hook=True,
+            overlap=True,
+            packed_recv_count=packed_recv_count,
+            comp_signal=comp_signal,
+            block_m=block_m,
+            threshold=threshold,
+            num_sms=num_sms,
+        )
+        hook()
+    torch.cuda.synchronize()
+    for it in range(num_iters):
+        probe_buf.zero_()
+        combined_x, event, hook = buffer.low_latency_combine(
+            simulated_gemm_x,
+            topk_idx,
+            topk_weights,
+            handle,
+            return_recv_hook=True,
+            overlap=True,
+            packed_recv_count=packed_recv_count,
+            comp_signal=comp_signal,
+            block_m=block_m,
+            threshold=threshold,
+            num_sms=num_sms,
+            probe_buffer=probe_buf,
+        )
+        hook()
+        torch.cuda.synchronize()
+        probes.append(_parse_probe_buffer(probe_buf))
+    return probes
+
+
 def run_dispatch_bench(buffer, x, topk_idx, num_tokens, num_experts):
     """Measure dispatch() latency distribution. No overlap variants exist
     yet for dispatch — this establishes the baseline for L3."""
@@ -205,8 +409,26 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["baseline", "overlap", "both", "sweep", "workload"],
+        choices=["baseline", "overlap", "both", "sweep", "workload", "probe"],
         default="both",
+    )
+    parser.add_argument(
+        "--probe-tokens",
+        type=str,
+        default="128,256,512",
+        help="--mode=probe: comma-separated num_tokens values to capture probes for",
+    )
+    parser.add_argument(
+        "--probe-sms",
+        type=str,
+        default="22,48,96",
+        help="--mode=probe: comma-separated num_sms values to capture probes for",
+    )
+    parser.add_argument(
+        "--probe-iters",
+        type=int,
+        default=5,
+        help="--mode=probe: combine calls per (ntok, num_sms) config to aggregate",
     )
     parser.add_argument("--num-sms", type=int, default=3)
     parser.add_argument(
@@ -320,6 +542,67 @@ def main():
         dist.barrier()
         if rank == 0:
             _report("=== workload scan DONE ===")
+        buffer.destroy() if hasattr(buffer, "destroy") else None
+        destroy_uccl()
+        return
+
+    if args.mode == "probe":
+        # Mechanism-attribution probe. Each (ntok, num_sms) config captures
+        # probe_iters combine calls. We print per-rank summary rows so host
+        # side can aggregate across ranks later (clock64 is per-SM and is
+        # not comparable across GPUs — cross-rank aggregation only makes
+        # sense in histogram form, not averaged).
+        sm_clock_khz = torch.cuda.get_device_properties(device).clock_rate
+        ntok_list = [int(t) for t in args.probe_tokens.split(",") if t.strip()]
+        sms_list = [int(s) for s in args.probe_sms.split(",") if s.strip()]
+        max_ntok = max(ntok_list)
+        if rank == 0:
+            _report(
+                f"PROBE_CONFIG sm_clock_khz={sm_clock_khz} "
+                f"hidden={args.hidden} num_topk={args.num_topk} "
+                f"num_experts={args.num_experts} world_size={world_size} "
+                f"probe_iters={args.probe_iters} "
+                f"ntok_list={ntok_list} sms_list={sms_list} "
+                f"probe_enabled={ep.probe_buffer_enabled()}"
+            )
+        for ntok in ntok_list:
+            x_w, topk_idx_w, topk_weights_w = build_inputs(
+                rank, ntok, args.hidden, args.num_topk, args.num_experts, device
+            )
+            for nsms in sms_list:
+                dist.barrier()
+                try:
+                    probes = run_probe_one(
+                        buffer,
+                        x_w,
+                        topk_idx_w,
+                        topk_weights_w,
+                        max_ntok,
+                        args.num_experts,
+                        num_sms=nsms,
+                        num_iters=args.probe_iters,
+                    )
+                except RuntimeError as e:
+                    _report(f"PROBE_ERROR rank={rank} ntok={ntok} nsms={nsms}: {e}")
+                    continue
+                summary = _probe_summary(probes, sm_clock_khz)
+                for mech, stats in summary.items():
+                    if stats is None:
+                        _report(
+                            f"PROBE rank={rank} ntok={ntok} nsms={nsms} "
+                            f"mech={mech} n=0 (no samples)"
+                        )
+                        continue
+                    _report(
+                        f"PROBE rank={rank} ntok={ntok} nsms={nsms} "
+                        f"mech={mech} n={stats['n']} "
+                        f"mean={stats['mean']:.2f} p50={stats['p50']:.2f} "
+                        f"p99={stats['p99']:.2f} p999={stats['p999']:.2f} "
+                        f"max={stats['max']:.2f} stdev={stats['stdev']:.2f}"
+                    )
+        dist.barrier()
+        if rank == 0:
+            _report("=== probe scan DONE ===")
         buffer.destroy() if hasattr(buffer, "destroy") else None
         destroy_uccl()
         return

@@ -1,3 +1,4 @@
+#include "combine_probe.cuh"
 #include "common.hpp"
 #include "ep_configs.cuh"
 #include "ep_launch.cuh"
@@ -749,7 +750,8 @@ __global__ __launch_bounds__(1024, 1) void combine(
     int* grid_sync_barrier_ptr = nullptr,
     int const* packed_recv_count = nullptr, int const* comp_signal = nullptr,
     int block_m = 64, int threshold = 0,
-    int* finish_counter_per_expert = nullptr) {
+    int* finish_counter_per_expert = nullptr,
+    ::uccl::ep::probe::ProbeBuffer* probe_buffer = nullptr) {
   auto const sm_id = static_cast<int>(blockIdx.x);
   auto const num_sms = static_cast<int>(gridDim.x);
   auto const thread_id = static_cast<int>(threadIdx.x);
@@ -790,6 +792,12 @@ __global__ __launch_bounds__(1024, 1) void combine(
   // Sending phase
   if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_COMBINE_RECV;
 
+  // Mechanism-attribution probe: record kernel-entry timestamp per SM.
+  // Only active under -DUCCL_EP_PROBE and when caller supplies a buffer.
+  if constexpr (kOverlap) {
+    UCCL_EP_PROBE_SM_START(probe_buffer, sm_id);
+  }
+
   // Clean up next buffer
   if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
 #pragma unroll
@@ -805,11 +813,17 @@ __global__ __launch_bounds__(1024, 1) void combine(
                                                       num_experts);
   }
 
+  int slot_iter = 0;  // Per-SM 0-based slot counter for probe indexing.
   for (int send_slot_idx = slot_start; send_slot_idx < num_experts;
-       send_slot_idx += slot_stride) {
+       send_slot_idx += slot_stride, ++slot_iter) {
     auto const dst_rank = send_slot_idx / num_local_experts;
     auto const local_expert_idx = send_slot_idx % num_local_experts;
     auto const global_expert_idx = rank * num_local_experts + local_expert_idx;
+
+    // Probe: slot wall-time window start (D-2 serial chain measurement).
+    if constexpr (kOverlap) {
+      UCCL_EP_PROBE_SLOT_START(probe_buffer, sm_id, slot_iter);
+    }
 
     // SBO overlap: before touching TMA/mbarrier for this slot, block the
     // whole SEND stripe until DeepGemm has produced enough down-gemm output
@@ -1077,6 +1091,12 @@ __global__ __launch_bounds__(1024, 1) void combine(
       // buffer
       if (dst_p2p_ptr == 0) {
         __threadfence_system();
+        // Probe: record timestamp before the first put of this slot (to
+        // bound NIC-write window; subsequent puts update PUT_LAST in place).
+        if constexpr (kOverlap) {
+          UCCL_EP_PROBE_PUT_FIRST(probe_buffer, sm_id, slot_iter,
+                                  (sub_warp_id == 0 && lane_id == 0));
+        }
         nvshmemi_ibgda_put_nbi_warp(
             dst_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr),
             buf_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr),
@@ -1086,6 +1106,10 @@ __global__ __launch_bounds__(1024, 1) void combine(
             // indexed by global_expert_idx
             lane_id, token_idx - offset, d2h_channel_addrs,
             num_d2h_channel_addrs, true, low_latency_buffer_idx);
+        if constexpr (kOverlap) {
+          UCCL_EP_PROBE_PUT_LAST(probe_buffer, sm_id, slot_iter,
+                                 (sub_warp_id == 0 && lane_id == 0));
+        }
       }
     }
 
@@ -1140,7 +1164,14 @@ __global__ __launch_bounds__(1024, 1) void combine(
     // was enough — under SM-stripe we need the full-CTA barrier.
     if constexpr (kOverlap) {
       __syncthreads();
+      // Probe: slot wall-time window end — after syncthreads so that all
+      // warps of this CTA are guaranteed past the finish-flag write.
+      UCCL_EP_PROBE_SLOT_END(probe_buffer, sm_id, slot_iter);
     }
+  }
+  // Probe: kernel-exit timestamp + actual slot count per SM (D-4).
+  if constexpr (kOverlap) {
+    UCCL_EP_PROBE_SM_END(probe_buffer, sm_id, slot_iter);
   }
 
 // Receiving phase
@@ -1282,7 +1313,8 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              void* rdma_buffer_ptr, void* atomic_buffer_ptr,
              int64_t* rdma_recv_flag_internode, bool overlap,
              int const* packed_recv_count, int const* comp_signal, int block_m,
-             int threshold, int num_sms_override) {
+             int threshold, int num_sms_override,
+             ::uccl::ep::probe::ProbeBuffer* probe_buffer) {
   constexpr int kNumMaxTopk = 9;
   int const num_local_experts = num_experts / num_ranks;
 
@@ -1400,7 +1432,7 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
         low_latency_buffer_idx, ipc_rdma_base_ptrs, rdma_buffer_ptr,           \
         atomic_buffer_ptr, rdma_recv_flag_internode, grid_sync_barrier_ptr,    \
         packed_recv_count, comp_signal, block_m, threshold,                    \
-        finish_counter_per_expert);                                            \
+        finish_counter_per_expert, probe_buffer);                              \
   }                                                                            \
   break
 
