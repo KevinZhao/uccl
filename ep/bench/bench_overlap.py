@@ -29,6 +29,31 @@ import torch.distributed as dist
 from buffer import Buffer
 from utils import bench, init_dist_under_torchrun, destroy_uccl
 
+
+def bench_detailed(fn, num_warmups=20, num_tests=50):
+    """Like utils.bench but returns the full array of per-call latencies so
+    we can compute p50/p99/p99.9 tails, not just min/avg/max."""
+    torch.cuda.synchronize()
+    current_device = torch.cuda.current_device()
+    cache = torch.empty(
+        int(256e6 // 4), dtype=torch.int, device=f"cuda:{current_device}"
+    )
+    for _ in range(num_warmups):
+        fn()
+    cache.zero_()
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    for i in range(num_tests):
+        start_events[i].record()
+        fn()
+        end_events[i].record()
+    torch.cuda.synchronize()
+    times = np.array(
+        [s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)]
+    )[1:]
+    return times  # seconds
+
+
 try:
     from uccl import ep
 except ImportError:
@@ -126,8 +151,16 @@ def run_mode_one(
         if return_recv_hook:
             hook()
 
-    avg_t, min_t, max_t = bench(combine_fn, num_warmups=20, num_tests=50)
-    return avg_t * 1e6, min_t * 1e6, max_t * 1e6
+    times_s = bench_detailed(combine_fn, num_warmups=20, num_tests=50)
+    times_us = times_s * 1e6
+    return (
+        float(times_us.mean()),
+        float(np.percentile(times_us, 50)),
+        float(np.percentile(times_us, 99)),
+        float(np.percentile(times_us, 99.9)),
+        float(times_us.min()),
+        float(times_us.max()),
+    )
 
 
 def main():
@@ -189,7 +222,7 @@ def main():
     for iteration in range(args.num_iters):
         for mode_name, overlap, num_sms_arg in modes:
             dist.barrier()
-            avg_us, min_us, max_us = run_mode_one(
+            avg_us, p50_us, p99_us, p999_us, min_us, max_us = run_mode_one(
                 buffer,
                 x,
                 topk_idx,
@@ -201,8 +234,8 @@ def main():
             )
             _report(
                 f"BENCH rank={rank} iter={iteration} mode={mode_name} "
-                f"num_sms={num_sms_arg} avg={avg_us:.2f} min={min_us:.2f} "
-                f"max={max_us:.2f}"
+                f"num_sms={num_sms_arg} avg={avg_us:.2f} p50={p50_us:.2f} "
+                f"p99={p99_us:.2f} p999={p999_us:.2f} min={min_us:.2f} max={max_us:.2f}"
             )
 
     dist.barrier()
