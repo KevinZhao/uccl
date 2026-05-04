@@ -792,11 +792,13 @@ __global__ __launch_bounds__(1024, 1) void combine(
   // Sending phase
   if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_COMBINE_RECV;
 
+#if UCCL_EP_PROBE_ENABLED
   // Mechanism-attribution probe: record kernel-entry timestamp per SM.
   // Only active under -DUCCL_EP_PROBE and when caller supplies a buffer.
   if constexpr (kOverlap) {
     UCCL_EP_PROBE_SM_START(probe_buffer, sm_id);
   }
+#endif
 
   // Clean up next buffer
   if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
@@ -813,17 +815,29 @@ __global__ __launch_bounds__(1024, 1) void combine(
                                                       num_experts);
   }
 
-  int slot_iter = 0;  // Per-SM 0-based slot counter for probe indexing.
+  // Per-SM 0-based slot counter for probe indexing. Only emitted when the
+  // probe is compiled in (UCCL_EP_PROBE_ENABLED) and only referenced inside
+  // `if constexpr (kOverlap)` branches below — so the non-overlap template
+  // instantiation does not carry the variable at all.
+#if UCCL_EP_PROBE_ENABLED
+  int slot_iter = 0;
+#endif
   for (int send_slot_idx = slot_start; send_slot_idx < num_experts;
-       send_slot_idx += slot_stride, ++slot_iter) {
+       send_slot_idx += slot_stride
+#if UCCL_EP_PROBE_ENABLED
+           , ++slot_iter
+#endif
+       ) {
     auto const dst_rank = send_slot_idx / num_local_experts;
     auto const local_expert_idx = send_slot_idx % num_local_experts;
     auto const global_expert_idx = rank * num_local_experts + local_expert_idx;
 
+#if UCCL_EP_PROBE_ENABLED
     // Probe: slot wall-time window start (D-2 serial chain measurement).
     if constexpr (kOverlap) {
       UCCL_EP_PROBE_SLOT_START(probe_buffer, sm_id, slot_iter);
     }
+#endif
 
     // SBO overlap: before touching TMA/mbarrier for this slot, block the
     // whole SEND stripe until DeepGemm has produced enough down-gemm output
@@ -1091,12 +1105,14 @@ __global__ __launch_bounds__(1024, 1) void combine(
       // buffer
       if (dst_p2p_ptr == 0) {
         __threadfence_system();
+#if UCCL_EP_PROBE_ENABLED
         // Probe: record timestamp before the first put of this slot (to
         // bound NIC-write window; subsequent puts update PUT_LAST in place).
         if constexpr (kOverlap) {
           UCCL_EP_PROBE_PUT_FIRST(probe_buffer, sm_id, slot_iter,
                                   (sub_warp_id == 0 && lane_id == 0));
         }
+#endif
         nvshmemi_ibgda_put_nbi_warp(
             dst_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr),
             buf_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr),
@@ -1106,10 +1122,12 @@ __global__ __launch_bounds__(1024, 1) void combine(
             // indexed by global_expert_idx
             lane_id, token_idx - offset, d2h_channel_addrs,
             num_d2h_channel_addrs, true, low_latency_buffer_idx);
+#if UCCL_EP_PROBE_ENABLED
         if constexpr (kOverlap) {
           UCCL_EP_PROBE_PUT_LAST(probe_buffer, sm_id, slot_iter,
                                  (sub_warp_id == 0 && lane_id == 0));
         }
+#endif
       }
     }
 
@@ -1164,15 +1182,19 @@ __global__ __launch_bounds__(1024, 1) void combine(
     // was enough — under SM-stripe we need the full-CTA barrier.
     if constexpr (kOverlap) {
       __syncthreads();
+#if UCCL_EP_PROBE_ENABLED
       // Probe: slot wall-time window end — after syncthreads so that all
       // warps of this CTA are guaranteed past the finish-flag write.
       UCCL_EP_PROBE_SLOT_END(probe_buffer, sm_id, slot_iter);
+#endif
     }
   }
+#if UCCL_EP_PROBE_ENABLED
   // Probe: kernel-exit timestamp + actual slot count per SM (D-4).
   if constexpr (kOverlap) {
     UCCL_EP_PROBE_SM_END(probe_buffer, sm_id, slot_iter);
   }
+#endif
 
 // Receiving phase
 LOW_LATENCY_COMBINE_RECV:

@@ -84,7 +84,9 @@ def _parse_probe_buffer(buf: torch.Tensor) -> dict:
 
     Layout must stay in sync with combine_probe.cuh: sm_start[kMaxSMs],
     sm_end[kMaxSMs], slot_start[kMaxSMs][kMaxSlotsPerSM], slot_end[...],
-    put_start[...], put_end[...], n_slots[kMaxSMs], pad[3].
+    put_start[...], put_end[...], n_slots[kMaxSMs]. The struct is
+    64B-aligned by construction (sum = 264 704 B = 4136 × 64) with no
+    explicit trailing padding.
     All timestamp fields are uint64; n_slots is int32.
     """
     max_sms = ep.probe_buffer_max_sms()
