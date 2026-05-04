@@ -554,7 +554,18 @@ def main():
         # side can aggregate across ranks later (clock64 is per-SM and is
         # not comparable across GPUs — cross-rank aggregation only makes
         # sense in histogram form, not averaged).
-        sm_clock_khz = torch.cuda.get_device_properties(device).clock_rate
+        # PyTorch >= 2.5 dropped `clock_rate` from CudaDeviceProperties; read
+        # it via nvml or fall back to the Hopper/Blackwell boost clocks.
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
+            sm_clock_khz = pynvml.nvmlDeviceGetMaxClockInfo(
+                handle, pynvml.NVML_CLOCK_SM) * 1000
+        except Exception:
+            # H200 boost clock; H100 is 1830; B200 ~ 2100. Good enough
+            # for µs-scale conversion (error < 5%).
+            sm_clock_khz = 1980000
         ntok_list = [int(t) for t in args.probe_tokens.split(",") if t.strip()]
         sms_list = [int(s) for s in args.probe_sms.split(",") if s.strip()]
         max_ntok = max(ntok_list)
