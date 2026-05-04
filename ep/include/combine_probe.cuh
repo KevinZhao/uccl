@@ -60,16 +60,22 @@ static_assert(sizeof(ProbeBuffer) % 64 == 0,
 // caller so we write exactly once per (sm, slot). We intentionally avoid
 // nested atomics — the writes are race-free because each (sm_id, slot_iter)
 // tuple is owned by exactly one warp.
+// Note on SM_START placement: fires BEFORE `next_clean` buffer init (which
+// only SM 0 performs). Thus D-4's T_SM for SM 0 includes the init work and
+// will be slightly higher than other SMs. That's the real latency SM 0 pays,
+// but downstream analysis should treat SM 0 as a known slight outlier.
 #define UCCL_EP_PROBE_SM_START(probe_ptr, sm_id)                              \
   do {                                                                        \
-    if ((probe_ptr) != nullptr && threadIdx.x == 0) {                         \
+    if ((probe_ptr) != nullptr && threadIdx.x == 0 &&                         \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs) {                               \
       (probe_ptr)->sm_start[sm_id] = clock64();                               \
     }                                                                         \
   } while (0)
 
 #define UCCL_EP_PROBE_SM_END(probe_ptr, sm_id, n_slots_done)                  \
   do {                                                                        \
-    if ((probe_ptr) != nullptr && threadIdx.x == 0) {                         \
+    if ((probe_ptr) != nullptr && threadIdx.x == 0 &&                         \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs) {                               \
       (probe_ptr)->sm_end[sm_id] = clock64();                                 \
       (probe_ptr)->n_slots[sm_id] = (n_slots_done);                           \
     }                                                                         \
@@ -78,6 +84,7 @@ static_assert(sizeof(ProbeBuffer) % 64 == 0,
 #define UCCL_EP_PROBE_SLOT_START(probe_ptr, sm_id, slot_iter)                 \
   do {                                                                        \
     if ((probe_ptr) != nullptr && threadIdx.x == 0 &&                         \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs &&                               \
         (slot_iter) < ::uccl::ep::probe::kMaxSlotsPerSM) {                    \
       (probe_ptr)->slot_start[sm_id][slot_iter] = clock64();                  \
     }                                                                         \
@@ -86,6 +93,7 @@ static_assert(sizeof(ProbeBuffer) % 64 == 0,
 #define UCCL_EP_PROBE_SLOT_END(probe_ptr, sm_id, slot_iter)                   \
   do {                                                                        \
     if ((probe_ptr) != nullptr && threadIdx.x == 0 &&                         \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs &&                               \
         (slot_iter) < ::uccl::ep::probe::kMaxSlotsPerSM) {                    \
       (probe_ptr)->slot_end[sm_id][slot_iter] = clock64();                    \
     }                                                                         \
@@ -94,9 +102,14 @@ static_assert(sizeof(ProbeBuffer) % 64 == 0,
 // Put probes are written once per token-loop by one elected lane per warp.
 // We record only the first and last put of each slot iteration — that's
 // enough to bound the slot's NIC-write window without N_token extra writes.
+// NOTE: T_put captures only inter-node IBGDA puts (guarded by
+// `dst_p2p_ptr == 0` at the call site). Intra-node IPC peers use NVLink
+// and are skipped — in mixed topologies the T_put distribution is
+// conditional on the inter-node subset.
 #define UCCL_EP_PROBE_PUT_FIRST(probe_ptr, sm_id, slot_iter, lane0_cond)      \
   do {                                                                        \
     if ((probe_ptr) != nullptr && (lane0_cond) &&                             \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs &&                               \
         (slot_iter) < ::uccl::ep::probe::kMaxSlotsPerSM &&                    \
         (probe_ptr)->put_start[sm_id][slot_iter] == 0) {                      \
       (probe_ptr)->put_start[sm_id][slot_iter] = clock64();                   \
@@ -106,6 +119,7 @@ static_assert(sizeof(ProbeBuffer) % 64 == 0,
 #define UCCL_EP_PROBE_PUT_LAST(probe_ptr, sm_id, slot_iter, lane0_cond)       \
   do {                                                                        \
     if ((probe_ptr) != nullptr && (lane0_cond) &&                             \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs &&                               \
         (slot_iter) < ::uccl::ep::probe::kMaxSlotsPerSM) {                    \
       (probe_ptr)->put_end[sm_id][slot_iter] = clock64();                     \
     }                                                                         \
