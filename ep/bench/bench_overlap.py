@@ -163,6 +163,34 @@ def run_mode_one(
     )
 
 
+def run_dispatch_bench(buffer, x, topk_idx, num_tokens, num_experts):
+    """Measure dispatch() latency distribution. No overlap variants exist
+    yet for dispatch — this establishes the baseline for L3."""
+
+    def dispatch_fn():
+        recv_x, recv_count, handle, _, _ = buffer.low_latency_dispatch(
+            x,
+            topk_idx,
+            num_tokens,
+            num_experts,
+            use_fp8=True,
+            async_finish=False,
+            return_recv_hook=False,
+        )
+        # recv_x / handle are reused; nothing to free explicitly
+
+    times_s = bench_detailed(dispatch_fn, num_warmups=20, num_tests=50)
+    times_us = times_s * 1e6
+    return (
+        float(times_us.mean()),
+        float(np.percentile(times_us, 50)),
+        float(np.percentile(times_us, 99)),
+        float(np.percentile(times_us, 99.9)),
+        float(times_us.min()),
+        float(times_us.max()),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=128)
@@ -177,7 +205,7 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["baseline", "overlap", "both", "sweep"],
+        choices=["baseline", "overlap", "both", "sweep", "workload"],
         default="both",
     )
     parser.add_argument("--num-sms", type=int, default=3)
@@ -186,6 +214,18 @@ def main():
         type=str,
         default="3,6,8,12,16,24,32",
         help="Comma-separated num_sms values to sweep in --mode=sweep",
+    )
+    parser.add_argument(
+        "--workload-tokens",
+        type=str,
+        default="128,256,512",
+        help="Comma-separated num_tokens values for --mode=workload",
+    )
+    parser.add_argument(
+        "--workload-sms",
+        type=int,
+        default=22,
+        help="Fixed num_sms used in --mode=workload overlap comparison",
     )
     args = parser.parse_args()
 
@@ -204,6 +244,68 @@ def main():
         allow_nvlink_for_low_latency_mode=True,
         explicitly_destroy=True,
     )
+
+    if args.mode == "workload":
+        # For each num_tokens: bench dispatch baseline, combine baseline,
+        # combine overlap-N (N = workload_sms). Inputs rebuilt per config.
+        token_list = [int(t) for t in args.workload_tokens.split(",") if t.strip()]
+        for iteration in range(args.num_iters):
+            for ntok in token_list:
+                x_w, topk_idx_w, topk_weights_w = build_inputs(
+                    rank, ntok, args.hidden, args.num_topk, args.num_experts, device
+                )
+                dist.barrier()
+                # Dispatch latency (baseline only)
+                avg, p50, p99, p999, mn, mx = run_dispatch_bench(
+                    buffer, x_w, topk_idx_w, ntok, args.num_experts
+                )
+                _report(
+                    f"BENCH rank={rank} iter={iteration} mode=dispatch-base "
+                    f"num_tokens={ntok} num_sms=0 avg={avg:.2f} p50={p50:.2f} "
+                    f"p99={p99:.2f} p999={p999:.2f} min={mn:.2f} max={mx:.2f}"
+                )
+                dist.barrier()
+                # Combine baseline
+                avg, p50, p99, p999, mn, mx = run_mode_one(
+                    buffer,
+                    x_w,
+                    topk_idx_w,
+                    topk_weights_w,
+                    ntok,
+                    args.num_experts,
+                    overlap=False,
+                    num_sms=0,
+                )
+                _report(
+                    f"BENCH rank={rank} iter={iteration} mode=combine-base "
+                    f"num_tokens={ntok} num_sms=0 avg={avg:.2f} p50={p50:.2f} "
+                    f"p99={p99:.2f} p999={p999:.2f} min={mn:.2f} max={mx:.2f}"
+                )
+                dist.barrier()
+                # Combine overlap at fixed num_sms
+                avg, p50, p99, p999, mn, mx = run_mode_one(
+                    buffer,
+                    x_w,
+                    topk_idx_w,
+                    topk_weights_w,
+                    ntok,
+                    args.num_experts,
+                    overlap=True,
+                    num_sms=args.workload_sms,
+                )
+                _report(
+                    f"BENCH rank={rank} iter={iteration} "
+                    f"mode=combine-overlap-{args.workload_sms} "
+                    f"num_tokens={ntok} num_sms={args.workload_sms} "
+                    f"avg={avg:.2f} p50={p50:.2f} p99={p99:.2f} "
+                    f"p999={p999:.2f} min={mn:.2f} max={mx:.2f}"
+                )
+        dist.barrier()
+        if rank == 0:
+            _report("=== workload scan DONE ===")
+        buffer.destroy() if hasattr(buffer, "destroy") else None
+        destroy_uccl()
+        return
 
     x, topk_idx, topk_weights = build_inputs(
         rank, args.num_tokens, args.hidden, args.num_topk, args.num_experts, device
