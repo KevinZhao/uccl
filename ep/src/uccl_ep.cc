@@ -1305,7 +1305,8 @@ class Buffer {
       std::uintptr_t packed_recv_count_ptr = 0,
       std::uintptr_t comp_signal_ptr = 0, int block_m = 64, int threshold = 0,
       int num_sms = 0, std::uintptr_t src_signals_ptr = 0,
-      int src_signal_expect_value = 0) {
+      int src_signal_expect_value = 0,
+      std::uintptr_t probe_buffer_ptr = 0) {
     EP_HOST_ASSERT(low_latency_mode);
     EP_HOST_ASSERT(x_ptr != 0 && topk_idx_ptr != 0 && topk_weights_ptr != 0);
     EP_HOST_ASSERT(src_info_ptr != 0 && layout_range_ptr != 0);
@@ -1382,6 +1383,12 @@ class Buffer {
         overlap ? reinterpret_cast<int*>(packed_recv_count_ptr) : nullptr;
     int* comp_signal =
         overlap ? reinterpret_cast<int*>(comp_signal_ptr) : nullptr;
+    // Mechanism-attribution probe buffer. Caller owns the device allocation
+    // and is responsible for zeroing it before each call (PUT_FIRST checks
+    // for 0 to write only the first put per slot). When nullptr, all probe
+    // macros are cheap no-ops regardless of -DUCCL_EP_PROBE.
+    ::uccl::ep::probe::ProbeBuffer* probe_buffer =
+        reinterpret_cast<::uccl::ep::probe::ProbeBuffer*>(probe_buffer_ptr);
 
     auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
@@ -1396,7 +1403,8 @@ class Buffer {
           num_d2h_channel_addrs, max_nvl_peers, low_latency_buffer_idx_used,
           d_ipc_rdma_base_ptrs, rdma_buffer_ptr, atomic_buffer_ptr,
           buffer.combine_rdma_recv_flag_buffer_internode, overlap,
-          packed_recv_count, comp_signal, block_m, threshold, num_sms);
+          packed_recv_count, comp_signal, block_m, threshold, num_sms,
+          probe_buffer);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE
@@ -2190,7 +2198,21 @@ NB_MODULE(ep, m) {
            nb::arg("comp_signal_ptr") = 0, nb::arg("block_m") = 64,
            nb::arg("threshold") = 0, nb::arg("num_sms") = 0,
            nb::arg("src_signals_ptr") = 0,
-           nb::arg("src_signal_expect_value") = 0);
+           nb::arg("src_signal_expect_value") = 0,
+           // Sprint B mechanism-attribution probe; 0 = disabled.
+           nb::arg("probe_buffer_ptr") = 0);
+  // Sprint B probe helpers — exposed unconditionally so Python code can
+  // construct a CUDA buffer of the right size via torch.empty(n, uint8).
+  // The fields are read back as int64 / int32 tensors matching the layout
+  // defined in combine_probe.cuh.
+  m.def("probe_buffer_bytes",
+        []() { return sizeof(::uccl::ep::probe::ProbeBuffer); });
+  m.def("probe_buffer_max_sms",
+        []() { return ::uccl::ep::probe::kMaxSMs; });
+  m.def("probe_buffer_max_slots_per_sm",
+        []() { return ::uccl::ep::probe::kMaxSlotsPerSM; });
+  m.def("probe_buffer_enabled",
+        []() { return UCCL_EP_PROBE_ENABLED != 0; });
   m.def("alloc_cmd_ring", &alloc_cmd_ring);
   m.def("free_cmd_ring", &free_cmd_ring);
   m.def("launch_gpu_issue_kernel", [](int blocks, int threads_per_block,

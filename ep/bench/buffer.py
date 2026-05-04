@@ -451,6 +451,11 @@ class Buffer:
         # Blackwell-path overlap kwargs (src_signals protocol).
         src_signals: Optional[torch.Tensor] = None,
         src_signal_expect_value: int = 0,
+        # Sprint B mechanism-attribution probe buffer. None (default) keeps
+        # the probe disabled; pass a uint8 CUDA tensor of size
+        # uccl.ep.probe_buffer_bytes() to capture per-SM/per-slot clock64
+        # timestamps. Caller is responsible for zeroing before each call.
+        probe_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
@@ -587,6 +592,7 @@ class Buffer:
             int(num_sms),
             src_signals.data_ptr() if src_signals is not None else 0,
             int(src_signal_expect_value),
+            probe_buffer.data_ptr() if probe_buffer is not None else 0,
         )
         tensors_to_record = (
             x_for_combine,

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "combine_probe.cuh"
+
 #include <cstddef>
 #include <cstdint>  // int64_t
 #include <vector>
@@ -45,6 +47,7 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              int64_t* rdma_recv_flag_internode = nullptr, bool overlap = false,
              int const* packed_recv_count = nullptr,
              int const* comp_signal = nullptr, int block_m = 64,
-             int threshold = 0, int num_sms_override = 0);
+             int threshold = 0, int num_sms_override = 0,
+             ::uccl::ep::probe::ProbeBuffer* probe_buffer = nullptr);
 }  // namespace internode_ll
 }  // namespace uccl

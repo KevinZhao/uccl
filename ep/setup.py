@@ -238,6 +238,14 @@ if __name__ == "__main__":
             cxx_flags.append("-DUSE_GRACE_HOPPER")
             nvcc_flags.append("-DUSE_GRACE_HOPPER")
 
+        # Sprint B mechanism-attribution probe. Opt-in via env var so the
+        # probe path is compiled out by default (zero runtime cost).
+        # Enable with `UCCL_EP_PROBE=1 python3 setup.py install`.
+        if int(os.getenv("UCCL_EP_PROBE", 0)):
+            print("Building with mechanism-attribution probe (UCCL_EP_PROBE)")
+            cxx_flags.append("-DUCCL_EP_PROBE")
+            nvcc_flags.append("-DUCCL_EP_PROBE")
+
         # Add Intel RDMA NIC support: auto-detect irdma or USE_INTEL_RDMA_NIC=1
         use_intel_rdma_nic = os.getenv("USE_INTEL_RDMA_NIC")
         if use_intel_rdma_nic is None or use_intel_rdma_nic == "":
