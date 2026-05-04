@@ -789,6 +789,14 @@ __global__ __launch_bounds__(1024, 1) void combine(
                      block_m
                : 0;
 
+#if UCCL_EP_PROBE_ENABLED
+  // Per-SM 0-based slot counter for probe indexing. Declared before the
+  // first goto so that nvcc accepts the downward branch past its
+  // initialization (nvcc rejects goto-over-init of a named variable even
+  // when the type is trivially constructible).
+  int slot_iter = 0;
+#endif
+
   // Sending phase
   if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_COMBINE_RECV;
 
@@ -815,12 +823,12 @@ __global__ __launch_bounds__(1024, 1) void combine(
                                                       num_experts);
   }
 
-  // Per-SM 0-based slot counter for probe indexing. Only emitted when the
-  // probe is compiled in (UCCL_EP_PROBE_ENABLED) and only referenced inside
-  // `if constexpr (kOverlap)` branches below — so the non-overlap template
-  // instantiation does not carry the variable at all.
+  // `slot_iter` is declared earlier (before the SEND-phase goto) under
+  // UCCL_EP_PROBE_ENABLED. It is reset here in case a caller ever enters
+  // the SEND phase twice on the same kernel instance (not currently the
+  // case, but safe).
 #if UCCL_EP_PROBE_ENABLED
-  int slot_iter = 0;
+  slot_iter = 0;
 #endif
   for (int send_slot_idx = slot_start; send_slot_idx < num_experts;
        send_slot_idx += slot_stride
