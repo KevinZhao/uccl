@@ -235,7 +235,10 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    num_rdma_bytes = 2 * 1024 * 1024 * 1024
+    # Sized for num_max_dispatch_tokens_per_rank up to 512 with hidden=7168.
+    # combine_recv_buffer = 288 experts * 512 tokens * 14336 B ≈ 2.1 GB;
+    # total ~= 8.4 GB across send/recv × 2 buffers. Round up to 10 GB.
+    num_rdma_bytes = 10 * 1024 * 1024 * 1024
     buffer = Buffer(
         group,
         num_rdma_bytes=num_rdma_bytes,
@@ -248,7 +251,10 @@ def main():
     if args.mode == "workload":
         # For each num_tokens: bench dispatch baseline, combine baseline,
         # combine overlap-N (N = workload_sms). Inputs rebuilt per config.
+        # num_max_dispatch_tokens_per_rank is fixed to max(token_list) so the
+        # buffer layout is sized once; actual dispatched count is x.size(0).
         token_list = [int(t) for t in args.workload_tokens.split(",") if t.strip()]
+        max_ntok = max(token_list)
         for iteration in range(args.num_iters):
             for ntok in token_list:
                 x_w, topk_idx_w, topk_weights_w = build_inputs(
@@ -257,7 +263,7 @@ def main():
                 dist.barrier()
                 # Dispatch latency (baseline only)
                 avg, p50, p99, p999, mn, mx = run_dispatch_bench(
-                    buffer, x_w, topk_idx_w, ntok, args.num_experts
+                    buffer, x_w, topk_idx_w, max_ntok, args.num_experts
                 )
                 _report(
                     f"BENCH rank={rank} iter={iteration} mode=dispatch-base "
@@ -271,7 +277,7 @@ def main():
                     x_w,
                     topk_idx_w,
                     topk_weights_w,
-                    ntok,
+                    max_ntok,
                     args.num_experts,
                     overlap=False,
                     num_sms=0,
@@ -288,7 +294,7 @@ def main():
                     x_w,
                     topk_idx_w,
                     topk_weights_w,
-                    ntok,
+                    max_ntok,
                     args.num_experts,
                     overlap=True,
                     num_sms=args.workload_sms,
