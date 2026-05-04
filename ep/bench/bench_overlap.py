@@ -223,9 +223,15 @@ def main():
     )
     parser.add_argument(
         "--workload-sms",
+        type=str,
+        default="22",
+        help="Comma-separated num_sms values swept per ntok in --mode=workload",
+    )
+    parser.add_argument(
+        "--num-rdma-bytes",
         type=int,
-        default=22,
-        help="Fixed num_sms used in --mode=workload overlap comparison",
+        default=20 * 1024 * 1024 * 1024,
+        help="RDMA buffer size; must cover max(ntok)*world_size*hidden*2 across modes",
     )
     args = parser.parse_args()
 
@@ -235,13 +241,9 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    # Sized for num_max_dispatch_tokens_per_rank up to 512 with hidden=7168.
-    # combine_recv_buffer = 288 experts * 512 tokens * 14336 B ≈ 2.1 GB;
-    # total ~= 8.4 GB across send/recv × 2 buffers. Round up to 10 GB.
-    num_rdma_bytes = 10 * 1024 * 1024 * 1024
     buffer = Buffer(
         group,
-        num_rdma_bytes=num_rdma_bytes,
+        num_rdma_bytes=args.num_rdma_bytes,
         low_latency_mode=True,
         num_qps_per_rank=args.num_experts // world_size,
         allow_nvlink_for_low_latency_mode=True,
@@ -249,12 +251,20 @@ def main():
     )
 
     if args.mode == "workload":
-        # For each num_tokens: bench dispatch baseline, combine baseline,
-        # combine overlap-N (N = workload_sms). Inputs rebuilt per config.
-        # num_max_dispatch_tokens_per_rank is fixed to max(token_list) so the
-        # buffer layout is sized once; actual dispatched count is x.size(0).
+        # For each num_tokens × each num_sms: bench dispatch baseline, combine
+        # baseline, combine overlap. Inputs rebuilt per ntok config. Buffer
+        # layout is sized once at max(token_list).
         token_list = [int(t) for t in args.workload_tokens.split(",") if t.strip()]
+        sms_list = [int(s) for s in args.workload_sms.split(",") if s.strip()]
         max_ntok = max(token_list)
+        # Stamp the static config so log rows stay self-describing.
+        if rank == 0:
+            _report(
+                f"CONFIG hidden={args.hidden} num_topk={args.num_topk} "
+                f"num_experts={args.num_experts} world_size={world_size} "
+                f"token_list={token_list} sms_list={sms_list} "
+                f"num_rdma_bytes={args.num_rdma_bytes}"
+            )
         for iteration in range(args.num_iters):
             for ntok in token_list:
                 x_w, topk_idx_w, topk_weights_w = build_inputs(
@@ -287,25 +297,26 @@ def main():
                     f"num_tokens={ntok} num_sms=0 avg={avg:.2f} p50={p50:.2f} "
                     f"p99={p99:.2f} p999={p999:.2f} min={mn:.2f} max={mx:.2f}"
                 )
-                dist.barrier()
-                # Combine overlap at fixed num_sms
-                avg, p50, p99, p999, mn, mx = run_mode_one(
-                    buffer,
-                    x_w,
-                    topk_idx_w,
-                    topk_weights_w,
-                    max_ntok,
-                    args.num_experts,
-                    overlap=True,
-                    num_sms=args.workload_sms,
-                )
-                _report(
-                    f"BENCH rank={rank} iter={iteration} "
-                    f"mode=combine-overlap-{args.workload_sms} "
-                    f"num_tokens={ntok} num_sms={args.workload_sms} "
-                    f"avg={avg:.2f} p50={p50:.2f} p99={p99:.2f} "
-                    f"p999={p999:.2f} min={mn:.2f} max={mx:.2f}"
-                )
+                # Combine overlap swept across all num_sms in sms_list
+                for nsms in sms_list:
+                    dist.barrier()
+                    avg, p50, p99, p999, mn, mx = run_mode_one(
+                        buffer,
+                        x_w,
+                        topk_idx_w,
+                        topk_weights_w,
+                        max_ntok,
+                        args.num_experts,
+                        overlap=True,
+                        num_sms=nsms,
+                    )
+                    _report(
+                        f"BENCH rank={rank} iter={iteration} "
+                        f"mode=combine-overlap-{nsms} "
+                        f"num_tokens={ntok} num_sms={nsms} "
+                        f"avg={avg:.2f} p50={p50:.2f} p99={p99:.2f} "
+                        f"p999={p999:.2f} min={mn:.2f} max={mx:.2f}"
+                    )
         dist.barrier()
         if rank == 0:
             _report("=== workload scan DONE ===")
