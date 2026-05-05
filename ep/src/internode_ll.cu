@@ -797,6 +797,24 @@ __global__ __launch_bounds__(1024, 1) void combine(
   int slot_iter = 0;
 #endif
 
+#if defined(__NVCC__)
+  // Function-scope TMA staging constants. Declared here (before the first
+  // goto) so that nvcc doesn't reject `goto LOW_LATENCY_COMBINE_RECV` as
+  // a "transfer of control bypasses initialization". Referenced by both
+  // the K-1b hoisted init block below (UCCL_EP_K1B only) AND by the
+  // per-slot body further down. Declaring once keeps the two in lockstep —
+  // the cpp-reviewer flagged an earlier version as MEDIUM risk for silent
+  // divergence if only one copy was updated.
+  constexpr int kCombineNumTMABufferBytes =
+      sizeof(int4) * WARP_SIZE * kNumUnrolls;
+  constexpr int kCombineNumStages = 3;
+  constexpr int kCombineNumPrefetch = 1;
+  EP_STATIC_ASSERT(kCombineNumStages == 3 and kCombineNumPrefetch == 1,
+                   "Invalid stages");
+  EP_STATIC_ASSERT(kNumUnrolls * kCombineNumStages <= 12,
+                   "TMA buffer size exceed limit");
+#endif
+
   // Sending phase
   if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_COMBINE_RECV;
 
@@ -856,22 +874,11 @@ __global__ __launch_bounds__(1024, 1) void combine(
   //
   // Sprint A baseline (UCCL_EP_K1B undefined) keeps the per-slot
   // init + drain for bit-exact comparability in Gate C.
+  //
+  // `kCombineNumTMABufferBytes` / `kCombineNumStages` / `kCombineNumPrefetch`
+  // are declared above the SEND-phase goto (see top of this function)
+  // so that nvcc does not reject the goto as bypassing their init.
   // ───────────────────────────────────────────────────────────────────
-#if defined(__NVCC__)
-  // Function-scope TMA staging constants. Referenced by both the K-1b
-  // hoisted init block (below, UCCL_EP_K1B only) AND by the per-slot
-  // body further down. Declaring them once keeps the two in lockstep —
-  // the cpp-reviewer flagged an earlier version as MEDIUM risk for
-  // silent divergence if only one copy was updated.
-  constexpr int kCombineNumTMABufferBytes =
-      sizeof(int4) * WARP_SIZE * kNumUnrolls;
-  constexpr int kCombineNumStages = 3;
-  constexpr int kCombineNumPrefetch = 1;
-  EP_STATIC_ASSERT(kCombineNumStages == 3 and kCombineNumPrefetch == 1,
-                   "Invalid stages");
-  EP_STATIC_ASSERT(kNumUnrolls * kCombineNumStages <= 12,
-                   "TMA buffer size exceed limit");
-#endif
 
 #if defined(__NVCC__) && defined(UCCL_EP_K1B)
   // Persistent phase parity storage. Exactly one slot's tma_phase[]
