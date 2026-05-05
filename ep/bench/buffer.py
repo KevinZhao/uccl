@@ -35,6 +35,42 @@ except ImportError:
     )
 
 
+# Workload-adaptive num_sms thresholds for low_latency_combine(overlap=True).
+# Derived from Sprint A/B median p99 across 16 ranks × 20 iter on 2× p5en
+# (DeepSeek-V3 MoE, 288 experts, hidden=7168, topk=8, apne1 2026-05-05):
+#
+#   (ntok, num_sms)   Sprint A median p99 µs   winner
+#   (128,  22)        40147                     ★ 29.6% below 128×96
+#   (128,  48)        40779
+#   (128,  96)        40397
+#   (256,  22)        40476                     ★
+#   (256,  48)        41760
+#   (256,  96)        40621
+#   (512,  22)        42692
+#   (512,  48)        40368                     ★ 5.4% below 512×22
+#   (512,  96)        40893
+#
+# Thresholds below are inclusive upper bounds for each tier. 384 splits
+# 256 and 512 symmetrically.
+_LL_OVERLAP_NUM_SMS_TIERS: Tuple[Tuple[int, int], ...] = (
+    (192, 22),   # ntok <= 192: decode / short prefill
+    (384, 22),   # 192 < ntok <= 384: medium prefill (256 cell)
+    (10_000, 48),  # ntok > 384: long prefill (512+)
+)
+
+
+def _pick_overlap_num_sms(num_combined_tokens: int) -> int:
+    """Return a num_sms recommendation for low_latency_combine(overlap=True)
+    based on measured per-workload optima. Returns 22 for decode, 48 for
+    long prefill. Callers that want to override should pass a positive
+    num_sms to `low_latency_combine`."""
+    for hi, nsms in _LL_OVERLAP_NUM_SMS_TIERS:
+        if num_combined_tokens <= hi:
+            return nsms
+    # Unreachable with the 10_000 sentinel above, but guard anyway.
+    return _LL_OVERLAP_NUM_SMS_TIERS[-1][1]
+
+
 class Buffer:
     """
     The core expert-parallel (EP) communication buffers for Mixture of Experts (MoE) model, which supports:
@@ -447,6 +483,11 @@ class Buffer:
         comp_signal: Optional[torch.Tensor] = None,
         block_m: int = 64,
         threshold: int = 0,
+        # num_sms=0 (default) triggers the workload-adaptive policy in
+        # `_pick_overlap_num_sms` below — chosen from Sprint A/B p99 medians on
+        # apne1 p5en (see sprint-b-k1b-ab-20260505T034422Z). A caller who wants
+        # to pin num_sms (e.g. for reproducibility) should pass a concrete
+        # positive value. num_sms<0 is rejected by the C++ binding.
         num_sms: int = 0,
         # Blackwell-path overlap kwargs (src_signals protocol).
         src_signals: Optional[torch.Tensor] = None,
@@ -541,6 +582,20 @@ class Buffer:
             hidden,
             num_experts,
         ) = handle
+        # Workload-adaptive num_sms. `num_sms=0` from the caller means "pick
+        # for me". The C++ kernel falls back to num_sms=3 in that case, which
+        # is only correct on the DeepEP/SGLang legacy SBO schedule. Our Sprint
+        # A/B data on apne1 p5en (DeepSeek-V3 MoE, 288 experts, hidden=7168,
+        # topk=8, 2×H200 EP=16) shows:
+        #   - ntok <= 192  → 22  (decode sweet spot, 29.6% p99 reduction)
+        #   - 192 < ntok <= 384 → 22 (still best for ntok=256 median p99)
+        #   - ntok > 384 → 48  (40368 µs median p99 vs 42692 µs at 22; avoids
+        #                        the ~14-17% prefill regression)
+        # Caller can override by passing a nonzero num_sms. `overlap=False`
+        # path doesn't use num_sms at all (legacy kernel sizes grid itself).
+        if overlap and num_sms == 0:
+            num_combined_tokens = topk_idx.size(0)
+            num_sms = _pick_overlap_num_sms(num_combined_tokens)
         x_for_combine = x
         if zero_copy and self._next_low_latency_combine_buffer is not None:
             staged = self._next_low_latency_combine_buffer
