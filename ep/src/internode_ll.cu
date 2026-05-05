@@ -815,6 +815,18 @@ __global__ __launch_bounds__(1024, 1) void combine(
                    "TMA buffer size exceed limit");
 #endif
 
+#if defined(__NVCC__) && defined(UCCL_EP_K1B)
+  // Persistent phase parity storage. Exactly one slot's tma_phase[]
+  // worth of registers, carried across the slot loop so the per-slot
+  // `mbarrier_init` burst can be hoisted once. Declared above the
+  // SEND-phase goto (same rationale as the kCombineNum* constants
+  // above: nvcc rejects goto-over-init of named variables).
+  uint32_t tma_phase_persist[kCombineNumStages] = {};
+  static_assert(sizeof(tma_phase_persist) / sizeof(tma_phase_persist[0]) ==
+                    kCombineNumStages,
+                "tma_phase_persist size must equal kCombineNumStages");
+#endif
+
   // Sending phase
   if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_COMBINE_RECV;
 
@@ -881,14 +893,9 @@ __global__ __launch_bounds__(1024, 1) void combine(
   // ───────────────────────────────────────────────────────────────────
 
 #if defined(__NVCC__) && defined(UCCL_EP_K1B)
-  // Persistent phase parity storage. Exactly one slot's tma_phase[]
-  // worth of registers, carried across the slot loop so the per-slot
-  // `mbarrier_init` burst can be hoisted once.
-  uint32_t tma_phase_persist[kCombineNumStages] = {};
-  static_assert(sizeof(tma_phase_persist) / sizeof(tma_phase_persist[0]) ==
-                    kCombineNumStages,
-                "tma_phase_persist size must equal kCombineNumStages");
-
+  // `tma_phase_persist[]` is declared above the SEND-phase goto (see top
+  // of this function) so that nvcc does not reject the goto as bypassing
+  // its initialization.
   if constexpr (kOverlap) {
     // Issue `mbarrier_init` ONCE for this SEND-phase kernel invocation.
     // Body re-declares `smem_buffer` with the same `extern __shared__`;
