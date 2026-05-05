@@ -82,12 +82,14 @@ def _alloc_probe_buffer(device):
 def _parse_probe_buffer(buf: torch.Tensor) -> dict:
     """Reinterpret the raw uint8 probe buffer into the ProbeBuffer layout.
 
-    Layout must stay in sync with combine_probe.cuh: sm_start[kMaxSMs],
-    sm_end[kMaxSMs], slot_start[kMaxSMs][kMaxSlotsPerSM], slot_end[...],
-    put_start[...], put_end[...], n_slots[kMaxSMs]. The struct is
-    64B-aligned by construction (sum = 264 704 B = 4136 × 64) with no
-    explicit trailing padding.
-    All timestamp fields are uint64; n_slots is int32.
+    Layout must stay in sync with combine_probe.cuh. v1 fields
+    (sm_start/sm_end, slot_start/slot_end, put_start/put_end, n_slots)
+    are always present. v2 fields (slot_body_start/slot_body_end,
+    sync_start/sync_end, schema_version) are present if the extension
+    was built at v2 size (≈ 527 KB) and populated when schema_version==2.
+    We detect the v2 size via probe_buffer_bytes().
+
+    All timestamp fields are uint64; n_slots and schema_version are int32.
     """
     max_sms = ep.probe_buffer_max_sms()
     max_slots = ep.probe_buffer_max_slots_per_sm()
@@ -106,6 +108,7 @@ def _parse_probe_buffer(buf: torch.Tensor) -> dict:
         offset += count * 4
         return view.numpy().astype("int32")
 
+    # v1 fields (always present)
     sm_start = take_u64(max_sms)
     sm_end = take_u64(max_sms)
     slot_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
@@ -113,7 +116,8 @@ def _parse_probe_buffer(buf: torch.Tensor) -> dict:
     put_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
     put_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
     n_slots = take_i32(max_sms)
-    return dict(
+
+    out = dict(
         sm_start=sm_start,
         sm_end=sm_end,
         slot_start=slot_start,
@@ -121,7 +125,25 @@ def _parse_probe_buffer(buf: torch.Tensor) -> dict:
         put_start=put_start,
         put_end=put_end,
         n_slots=n_slots,
+        schema_version=1,
     )
+
+    # v2 fields (present if buffer is large enough — v2 size ≈ 2× v1).
+    # v1 size = kMaxSMs*(16 + 8*4*kMaxSlotsPerSM + 4) ≈ 264 704 B.
+    # v2 adds 4 more [kMaxSMs][kMaxSlotsPerSM] uint64 arrays + int32 header.
+    v2_extra = 4 * max_sms * max_slots * 8 + 64  # 64 = schema region block
+    if host.numel() >= offset + v2_extra:
+        slot_body_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+        slot_body_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+        sync_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+        sync_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+        schema_version = int(take_i32(1)[0])
+        out["slot_body_start"] = slot_body_start
+        out["slot_body_end"] = slot_body_end
+        out["sync_start"] = sync_start
+        out["sync_end"] = sync_end
+        out["schema_version"] = schema_version
+    return out
 
 
 def _probe_summary(probes: list, sm_clock_khz: int) -> dict:
@@ -136,15 +158,23 @@ def _probe_summary(probes: list, sm_clock_khz: int) -> dict:
       - n_slots[sm] may be 0 for SMs that the grid didn't spin up (rare)
         or when UCCL_EP_PROBE was compiled out — caller must check.
 
-    Returns dict with keys T_slot, T_put, T_sm each mapping to a list of
-    values (µs) across all (iter, sm, slot) samples; caller computes CDF.
+    Returns dict with keys T_slot, T_put, T_sm (v1) and, when schema v2 is
+    active, T_init, T_body, T_sync (v2 decomposition of T_slot). Each
+    key maps to a stats dict across all (iter, sm, slot) samples.
     """
     T_slot = []  # D-2: slot_end - slot_start (whole slot wall-time)
     T_put = []  # D-1: put_end - put_start (IBGDA NIC window)
     T_sm = []  # D-4: sm_end - sm_start (per-SM total)
+    # v2 decomposition of T_slot = T_init + T_body + T_sync (+ micro residual)
+    T_init = []  # slot_body_start - slot_start (mbarrier_init burst)
+    T_body = []  # slot_body_end - slot_body_start (pure token pipeline)
+    T_sync = []  # sync_end - sync_start (slot-end barrier + finish-flag)
+    schema = 1
     for p in probes:
         n_slots = p["n_slots"]
         max_sms = len(n_slots)
+        schema = max(schema, int(p.get("schema_version", 1)))
+        has_v2 = schema >= 2 and "slot_body_start" in p
         for sm in range(max_sms):
             n = int(n_slots[sm])
             if n <= 0:
@@ -153,15 +183,25 @@ def _probe_summary(probes: list, sm_clock_khz: int) -> dict:
             if sm_delta > 0:
                 T_sm.append(sm_delta)
             for slot in range(min(n, p["slot_start"].shape[1])):
-                slot_delta = int(p["slot_end"][sm, slot]) - int(
-                    p["slot_start"][sm, slot]
-                )
-                if slot_delta > 0:
-                    T_slot.append(slot_delta)
+                ss = int(p["slot_start"][sm, slot])
+                se = int(p["slot_end"][sm, slot])
+                if se > ss > 0:
+                    T_slot.append(se - ss)
                 ps = int(p["put_start"][sm, slot])
                 pe = int(p["put_end"][sm, slot])
-                if ps > 0 and pe > ps:
+                if pe > ps > 0:
                     T_put.append(pe - ps)
+                if has_v2:
+                    bs = int(p["slot_body_start"][sm, slot])
+                    be = int(p["slot_body_end"][sm, slot])
+                    ys = int(p["sync_start"][sm, slot])
+                    ye = int(p["sync_end"][sm, slot])
+                    if bs > ss > 0:
+                        T_init.append(bs - ss)
+                    if be > bs > 0:
+                        T_body.append(be - bs)
+                    if ye > ys > 0:
+                        T_sync.append(ye - ys)
     cycles_to_us = 1.0 / (sm_clock_khz * 1000.0) * 1e6
 
     def stats(arr):
@@ -178,7 +218,15 @@ def _probe_summary(probes: list, sm_clock_khz: int) -> dict:
             stdev=float(a.std()),
         )
 
-    return dict(T_slot=stats(T_slot), T_put=stats(T_put), T_sm=stats(T_sm))
+    out = dict(
+        T_slot=stats(T_slot), T_put=stats(T_put), T_sm=stats(T_sm),
+        schema_version=schema,
+    )
+    if schema >= 2:
+        out["T_init"] = stats(T_init)
+        out["T_body"] = stats(T_body)
+        out["T_sync"] = stats(T_sync)
+    return out
 
 
 def build_inputs(rank, num_tokens, hidden, num_topk, num_experts, device):
@@ -599,6 +647,14 @@ def main():
                     _report(f"PROBE_ERROR rank={rank} ntok={ntok} nsms={nsms}: {e}")
                     continue
                 summary = _probe_summary(probes, sm_clock_khz)
+                schema_version = summary.pop("schema_version", 1)
+                if rank == 0:
+                    # One-shot advisory so the host parser knows which v2
+                    # fields to expect. Printing once avoids log bloat.
+                    _report(
+                        f"PROBE_SCHEMA ntok={ntok} nsms={nsms} "
+                        f"version={schema_version}"
+                    )
                 for mech, stats in summary.items():
                     if stats is None:
                         _report(
