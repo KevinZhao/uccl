@@ -287,18 +287,122 @@ Write `ANALYSIS_MECHANISM.md` alongside the logs, including:
   Sprint A's p99 on the same (ntok=128, num_sms=22) cell
 - Cost and session duration (timestamps from the log files)
 
+## Phase 9 — K-1b A/B regression (next GPU session goal)
+
+Goal: confirm the K-1b kernel variant (commit 2c1c756b+) does not
+regress Gate B correctness AND improves at least one prefill cell vs.
+the Sprint A baseline kernel. Acceptance comes from
+`ANALYSIS_MECHANISM.md`:
+
+> K-1b must not regress any (ntok, num_sms) cell by more than 3% AND
+> must improve at least one prefill cell (target: ntok=256 nsms=22,
+> expected 5-10% improvement based on the 53 µs slot-boundary overhead
+> finding).
+
+### 9.1 Two builds side-by-side
+
+Both builds come from the same commit; the flag is the only diff. Keep
+each `install/` in a separate venv or install prefix so we can A/B
+swap without a rebuild:
+
+```bash
+cd /workspace/uccl/ep
+# Baseline — Sprint A kernel, no K-1b, no probe
+INSTALL_DIR=/workspace/ep-install-sprintA \
+  python3 setup.py install 2>&1 | tail -20
+
+# K-1b variant
+python3 setup.py clean
+UCCL_EP_K1B=1 \
+  INSTALL_DIR=/workspace/ep-install-k1b \
+  python3 setup.py install 2>&1 | tail -20
+```
+
+Sanity check both install prefixes contain an `ep*.so` with matching
+hashes minus the `.so` body:
+
+```bash
+ls -la /workspace/ep-install-sprintA/ep.*.so /workspace/ep-install-k1b/ep.*.so
+```
+
+### 9.2 Gate B on K-1b (MUST PASS)
+
+Run all 6 Gate B tests under the K-1b `.so` — this is the blocking
+gate for shipping K-1b.
+
+```bash
+PYTHONPATH=/workspace/ep-install-k1b:$PYTHONPATH \
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+  --master_addr=$MASTER --master_port=12355 \
+  tests/test_low_latency_overlap.py \
+    --num-experts=288 --hidden=7168 --num-topk=8 \
+    --num-sms-list=1,2,3,4,8,16,22,48,96 \
+  2> gate-b-k1b-r${R}.log
+grep -E "(PASS|FAIL|max diff|nonzero_frac)" gate-b-k1b-r${R}.log
+```
+
+Success: every (rank, num_sms) prints `max=0 nonzero_frac=0` AND all 6
+test functions (analytical oracle, overlap_num_sms_full,
+overlap_bit_exact, overlap_signal_wait, overlap_zero_token_expert,
+overlap_bad_kwargs) complete with PASS. Any non-zero diff means
+K-1b's phase-parity carry broke correctness — stop and triage.
+
+### 9.3 Workload A/B grid (both .so's, same grid)
+
+For each build, run the same workload grid so we can compare p99
+directly:
+
+```bash
+for VARIANT in sprintA k1b; do
+  PYTHONPATH=/workspace/ep-install-${VARIANT}:$PYTHONPATH \
+  torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+    --master_addr=$MASTER --master_port=12355 \
+    bench_overlap.py --mode=workload \
+      --workload-tokens=128,256,512 \
+      --workload-sms=22,48,96 \
+      --num-iters=20 \
+      --hidden=7168 --num-topk=8 --num-experts=288 \
+      --num-rdma-bytes=$((20 * 1024**3)) \
+    2> workload-${VARIANT}-r${R}.log
+done
+```
+
+Acceptance gate (computed after log retrieval):
+
+| Cell               | Target                      |
+|--------------------|-----------------------------|
+| (128, 22) decode   | K-1b p99 ≤ Sprint A p99 ×1.03 |
+| (256, 22) prefill  | K-1b p99 ≤ Sprint A p99 ×0.95 (improvement) |
+| (512, 22) prefill  | K-1b p99 ≤ Sprint A p99 ×1.03 |
+| all other cells    | K-1b p99 ≤ Sprint A p99 ×1.03 |
+
+**If the (256, 22) improvement lands**, the probe's mechanism claim
+is confirmed and Sprint B can ship K-1b.
+
+### 9.4 Optional — probe on K-1b
+
+Not required for acceptance but valuable as evidence that K-1b
+actually shrunk `sm_overhead_ratio` (the mechanism quantity). Build a
+third variant `UCCL_EP_K1B=1 UCCL_EP_PROBE=1 python3 setup.py install`
+and rerun Phase 4's probe scan. Expected signal: `sm_ovhd` drops from
+~1.43 (Sprint A) toward 1.10-1.20. If it doesn't drop, the slot-body
+`__syncthreads()` between iterations may still be serializing — a
+K-1b follow-up.
+
 ## Total session budget
 
 | Phase | Duration | Cost (p5en spot ~$8/hr × 2 nodes) |
 |---|---|---|
 | 1 start + leaf retry | ~6-15 min | $1.60 - $4.00 |
-| 2 build | ~12 min | $3.20 |
+| 2 build (single variant) | ~12 min | $3.20 |
 | 3 Gate B | ~3 min | $0.80 |
 | 4 probe | ~12 min | $3.20 |
 | 5 workload | ~10 min | $2.67 |
 | 6 scp | ~2 min | $0.53 |
 | 7 teardown | ~3 min | ~$0 |
-| **Total** | **~50 min** | **~$16** |
+| 9 K-1b A/B (Phase 9 = 2 builds + Gate B + 2 workload runs) | ~35 min | ~$9.30 |
+| **Total (probe only)** | **~50 min** | **~$16** |
+| **Total (K-1b A/B session, Phase 1+9+6+7)** | **~60 min** | **~$19** |
 
 If any phase exits non-zero and can't be recovered in 3 min, skip to
 Phase 7. Don't let the spot burn while you debug.
