@@ -246,6 +246,16 @@ if __name__ == "__main__":
             cxx_flags.append("-DUCCL_EP_PROBE")
             nvcc_flags.append("-DUCCL_EP_PROBE")
 
+        # Sprint B K-1b kernel variant: hoist mbarrier init + TMA drain out
+        # of the per-slot body so the slot-inter sync overhead (~30% of
+        # per-SM wall time per the probe data) shrinks. Opt-in so we can
+        # A/B test against Sprint A baseline kernel in the same codebase.
+        # Enable with `UCCL_EP_K1B=1 python3 setup.py install`.
+        if int(os.getenv("UCCL_EP_K1B", 0)):
+            print("Building with K-1b slot-inter prefetch (UCCL_EP_K1B)")
+            cxx_flags.append("-DUCCL_EP_K1B")
+            nvcc_flags.append("-DUCCL_EP_K1B")
+
         # Add Intel RDMA NIC support: auto-detect irdma or USE_INTEL_RDMA_NIC=1
         use_intel_rdma_nic = os.getenv("USE_INTEL_RDMA_NIC")
         if use_intel_rdma_nic is None or use_intel_rdma_nic == "":

@@ -830,6 +830,80 @@ __global__ __launch_bounds__(1024, 1) void combine(
 #if UCCL_EP_PROBE_ENABLED
   slot_iter = 0;
 #endif
+
+  // ───────────────────────────────────────────────────────────────────
+  // K-1b (UCCL_EP_K1B) — hoist mbarrier_init + drain out of the per-slot
+  // body on the overlap path. Sprint B probe (ANALYSIS_MECHANISM.md,
+  // p5en apne1-az4, 2026-05-04) showed 30–40% of per-SM wall time is
+  // slot-inter sync overhead.
+  //
+  // In K-1b we declare persistent `tma_phase_persist[kNumStages]`
+  // registers here that survive across slot iterations, and issue
+  // `mbarrier_init` ONCE before entering the slot loop. The slot body
+  // below still owns its own `tma_buffer` / `tma_mbarrier` /
+  // `tma_phase` local symbols; under K-1b+kOverlap those are *aliases*
+  // of the persistent register bank (explained in the slot body).
+  //
+  // Correctness invariants relied upon for the persistent state:
+  //   (a) no TMA loads from slot N-1 leak into slot N because the token
+  //       loop's `tma_store_wait()` drains the store-side; TMA loads
+  //       launched at iter k only complete phase via `mbarrier_wait`
+  //       at iter k, not later.
+  //   (b) mbarrier phase parity: each stage cycles every two
+  //       wait-complete events. Carrying parity into slot N matches the
+  //       parity at slot N-1's kNumIters boundary because stages are
+  //       independent.
+  //
+  // Sprint A baseline (UCCL_EP_K1B undefined) keeps the per-slot
+  // init + drain for bit-exact comparability in Gate C.
+  // ───────────────────────────────────────────────────────────────────
+#if defined(__NVCC__)
+  // Function-scope TMA staging constants. Referenced by both the K-1b
+  // hoisted init block (below, UCCL_EP_K1B only) AND by the per-slot
+  // body further down. Declaring them once keeps the two in lockstep —
+  // the cpp-reviewer flagged an earlier version as MEDIUM risk for
+  // silent divergence if only one copy was updated.
+  constexpr int kCombineNumTMABufferBytes =
+      sizeof(int4) * WARP_SIZE * kNumUnrolls;
+  constexpr int kCombineNumStages = 3;
+  constexpr int kCombineNumPrefetch = 1;
+  EP_STATIC_ASSERT(kCombineNumStages == 3 and kCombineNumPrefetch == 1,
+                   "Invalid stages");
+  EP_STATIC_ASSERT(kNumUnrolls * kCombineNumStages <= 12,
+                   "TMA buffer size exceed limit");
+#endif
+
+#if defined(__NVCC__) && defined(UCCL_EP_K1B)
+  // Persistent phase parity storage. Exactly one slot's tma_phase[]
+  // worth of registers, carried across the slot loop so the per-slot
+  // `mbarrier_init` burst can be hoisted once.
+  uint32_t tma_phase_persist[kCombineNumStages] = {};
+  static_assert(sizeof(tma_phase_persist) / sizeof(tma_phase_persist[0]) ==
+                    kCombineNumStages,
+                "tma_phase_persist size must equal kCombineNumStages");
+
+  if constexpr (kOverlap) {
+    // Issue `mbarrier_init` ONCE for this SEND-phase kernel invocation.
+    // Body re-declares `smem_buffer` with the same `extern __shared__`;
+    // CUDA treats all such declarations as aliases for the same dyn
+    // smem bank, so the init here writes the same addresses the body
+    // will wait on.
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    auto smem_ptr_init =
+        smem_buffer + warp_id * kCombineNumStages *
+                          (kCombineNumTMABufferBytes + 16);
+    if (lane_id < kCombineNumStages) {
+      auto mbar = reinterpret_cast<uint64_t*>(
+          smem_ptr_init + lane_id * (kCombineNumTMABufferBytes + 16) +
+          kCombineNumTMABufferBytes);
+      mbarrier_init(mbar, 1);
+      fence_view_async_shared();
+      fence_barrier_init();
+    }
+    __syncwarp();
+  }
+#endif  // UCCL_EP_K1B
+
   for (int send_slot_idx = slot_start; send_slot_idx < num_experts;
        send_slot_idx += slot_stride
 #if UCCL_EP_PROBE_ENABLED
@@ -895,16 +969,22 @@ __global__ __launch_bounds__(1024, 1) void combine(
     unpack2(layout, num_tokens_to_send, offset);
 
 #if defined(__NVCC__)
-    // TMA stuffs
-    constexpr int kNumTMABufferBytes = sizeof(int4) * WARP_SIZE * kNumUnrolls;
-    constexpr int kNumStages = 3;
-    constexpr int kNumPrefetch = 1;
-    EP_STATIC_ASSERT(kNumStages == 3 and kNumPrefetch == 1, "Invalid stages");
+    // TMA stuffs. All paths declare the same slot-local names
+    // (`tma_buffer`, `tma_mbarrier`, `tma_phase[]`) so the token loop
+    // body below is path-independent.
+    //
+    // `kNumTMABufferBytes` / `kNumStages` / `kNumPrefetch` are aliases
+    // of the function-scope `kCombineNum*` constants declared before
+    // the slot loop; aliasing (not re-declaring the same literals)
+    // prevents silent divergence between the hoisted K-1b init block
+    // and the slot body — cpp-reviewer MEDIUM issue.
+    constexpr int kNumTMABufferBytes = kCombineNumTMABufferBytes;
+    constexpr int kNumStages = kCombineNumStages;
+    constexpr int kNumPrefetch = kCombineNumPrefetch;
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     auto smem_ptr =
         smem_buffer + warp_id * kNumStages * (kNumTMABufferBytes + 16);
-    uint32_t tma_phase[kNumStages] = {};
     auto tma_buffer = PatternVisitor([=](int const& i) {
       return reinterpret_cast<int4*>(smem_ptr + i * (kNumTMABufferBytes + 16));
     });
@@ -912,25 +992,47 @@ __global__ __launch_bounds__(1024, 1) void combine(
       return reinterpret_cast<uint64_t*>(
           smem_ptr + i * (kNumTMABufferBytes + 16) + kNumTMABufferBytes);
     });
-    EP_STATIC_ASSERT(kNumUnrolls * kNumStages <= 12,
-                     "TMA buffer size exceed limit");
 
-    // SM-stripe: drain any TMA prefetches left pending from the previous
-    // iteration so they cannot arrive at the newly-reset mbarriers below
-    // and flip phase parity out of sync with our register tma_phase[].
-    // No-op on the first iteration (nothing in flight).
+    // Phase parity. K-1b+kOverlap sources from the persistent register
+    // bank declared before the slot loop; everyone else starts at zero.
+    uint32_t tma_phase[kNumStages];
+#if defined(UCCL_EP_K1B)
+    if constexpr (kOverlap) {
+#pragma unroll
+      for (int s = 0; s < kNumStages; ++s) tma_phase[s] = tma_phase_persist[s];
+    } else {
+#pragma unroll
+      for (int s = 0; s < kNumStages; ++s) tma_phase[s] = 0;
+    }
+#else
+#pragma unroll
+    for (int s = 0; s < kNumStages; ++s) tma_phase[s] = 0;
+#endif
+
+#if defined(UCCL_EP_K1B)
+    // Per-slot init + drain — SKIPPED under K-1b+kOverlap (hoisted).
+    // Still required on the legacy (kOverlap=false) path.
+    if constexpr (!kOverlap) {
+      if (lane_id < kNumStages) {
+        mbarrier_init(tma_mbarrier[lane_id], 1);
+        fence_view_async_shared();
+        fence_barrier_init();
+      }
+      __syncwarp();
+    }
+#else
+    // Sprint A path — per-slot drain + init.
     if constexpr (kOverlap) {
       asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
       __syncwarp();
     }
-
-    // Initialize m-barriers
     if (lane_id < kNumStages) {
       mbarrier_init(tma_mbarrier[lane_id], 1);
       fence_view_async_shared();
       fence_barrier_init();
     }
     __syncwarp();
+#endif  // UCCL_EP_K1B
 
     constexpr int kNumIters = hidden_bf16_int4_pad / (WARP_SIZE * kNumUnrolls);
     auto tma_load_and_arrive = [&](int const& stage_idx, int4 const* gmem_ptr,
@@ -1196,6 +1298,17 @@ __global__ __launch_bounds__(1024, 1) void combine(
       UCCL_EP_PROBE_SLOT_END(probe_buffer, sm_id, slot_iter);
 #endif
     }
+
+#if defined(__NVCC__) && defined(UCCL_EP_K1B)
+    // K-1b: persist tma_phase[] across slots so the next slot's token
+    // loop picks up the phase parity it would have had if init had run
+    // locally again. This is what lets us skip the mbarrier_init burst
+    // at the top of the next slot.
+    if constexpr (kOverlap) {
+#pragma unroll
+      for (int s = 0; s < kNumStages; ++s) tma_phase_persist[s] = tma_phase[s];
+    }
+#endif
   }
 #if UCCL_EP_PROBE_ENABLED
   // Probe: kernel-exit timestamp + actual slot count per SM (D-4).
