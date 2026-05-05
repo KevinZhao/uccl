@@ -1,20 +1,25 @@
-// combine_probe.cuh — Sprint B mechanism-attribution probe.
+// combine_probe.cuh — mechanism-attribution probe.
 //
 // Enabled at compile time via -DUCCL_EP_PROBE. When disabled, the probe
 // macros collapse to no-ops and there is zero runtime cost or memory use.
 //
-// The probe captures per-(SM, slot) clock64() timestamps at four points in
-// the combine SEND phase so we can separate:
-//   D-1  NIC queue contention: put_end - put_start per slot
-//   D-2  Serial chain length:  slot_end - slot_start per slot
-//   D-4  SM load imbalance:    sm_end - sm_start per SM
+// v1 (Sprint B) captured four points per slot so we could attribute time to:
+//   D-1  NIC queue contention: put_end - put_start per slot  (T_put)
+//   D-2  Serial chain length:  slot_end - slot_start per slot (T_slot)
+//   D-4  SM load imbalance:    sm_end - sm_start per SM      (T_sm)
 //
-// Layout is fixed-size so a single cudaMalloc + cudaMemset is enough
-// per bench run; no per-call allocation.
+// v2 (Sprint C planning) adds two more pairs to decompose T_slot further.
+// Sprint B probe's sm_ovhd = T_sm / (n_slots × T_slot) overestimated the
+// hoistable fraction because it lumped the slot-end `__syncthreads()` +
+// finish-flag IBGDA atomic into the "between slots" residual. K-1b attacked
+// only the `mbarrier_init` burst and underperformed its prediction.
 //
-// Semantics are best-effort. clock64() reads the SM clock, which on Hopper
-// runs at the boost frequency (≈ 1.98 GHz). Absolute µs are derived in the
-// host-side dump by dividing by cudaDeviceProp.clockRate (in kHz).
+// v2 measurements (written at the same four call sites, zero extra syncs):
+//   D-2a body:  slot_body_start → slot_body_end  — pure token pipeline
+//   D-2b sync:  sync_start      → sync_end       — cost of the CTA barrier
+//                                                  + finish-flag IBGDA at slot end
+//
+// Absolute µs derivation unchanged: divide by SM clock (≈ 1.98 GHz on H200).
 
 #pragma once
 
@@ -31,6 +36,7 @@ static constexpr int kMaxSMs = 128;
 static constexpr int kMaxSlotsPerSM = 64;
 
 struct ProbeBuffer {
+  // v1 fields (Sprint B) ---------------------------------------------------
   // Per-SM totals (D-4).
   uint64_t sm_start[kMaxSMs];
   uint64_t sm_end[kMaxSMs];
@@ -41,10 +47,27 @@ struct ProbeBuffer {
   uint64_t put_end[kMaxSMs][kMaxSlotsPerSM];
   // Number of slots each SM actually processed. The tail SMs may process
   // one fewer slot than the head SMs when num_experts is not divisible by
-  // num_sms. With kMaxSMs=128 this int32 array is 512 B, which keeps the
-  // overall struct size at 264 704 B = 2^12 · 64.5 — naturally 64B-aligned
-  // without explicit padding.
+  // num_sms.
   int32_t n_slots[kMaxSMs];
+
+  // v2 fields (Sprint C) ---------------------------------------------------
+  // Probe v1 showed that `T_slot = slot_end - slot_start` aggregates:
+  //   (a) mbarrier_init burst at slot start (hoisted by K-1b)
+  //   (b) pure token-pipeline body
+  //   (c) end-of-slot `__syncthreads()` + finish-flag IBGDA atomic
+  // v2 adds two pairs to separate (b) from (c). The (a) region is the span
+  // between slot_start and slot_body_start, so it's derivable without a
+  // fifth pair. All v2 writes hit the same call sites as v1, no new syncs.
+  uint64_t slot_body_start[kMaxSMs][kMaxSlotsPerSM];  // after per-slot init
+  uint64_t slot_body_end[kMaxSMs][kMaxSlotsPerSM];    // before slot-end sync
+  uint64_t sync_start[kMaxSMs][kMaxSlotsPerSM];       // same as slot_body_end
+  uint64_t sync_end[kMaxSMs][kMaxSlotsPerSM];         // same as slot_end
+
+  // Schema tag. Writer sets 2 when v2 macros are active; callers/analyzers
+  // inspect this to know which fields are populated. Zero → no probe wrote
+  // anything (buffer stale or disabled), nonzero → at least v1.
+  int32_t schema_version;
+  int32_t _pad_for_64B_alignment[15];  // schema_version + pad = 64 B → total stays 64B-aligned
 };
 
 static_assert(sizeof(ProbeBuffer) % 64 == 0,
@@ -125,6 +148,66 @@ static_assert(sizeof(ProbeBuffer) % 64 == 0,
     }                                                                         \
   } while (0)
 
+// v2 macros (T_slot decomposition). Call from the same threadIdx.x==0 /
+// warp-scoped gate as v1 macros. Cost is one clock64() + one uint64 store
+// each, equivalent to v1; the total 6 timestamps per slot (up from 4) is
+// still 6 fused clock reads, which on Hopper is ≈30 cycles total.
+//
+// Placement guide for callers (internode_ll.cu SEND phase):
+//   slot_start    — right at the top of the slot for-loop (BEFORE the
+//                   comp_signal spin and BEFORE the per-slot mbarrier_init)
+//   slot_body_start — AFTER the per-slot mbarrier_init burst, immediately
+//                   BEFORE the token for-loop begins. Under K-1b+kOverlap
+//                   there is no per-slot init; body_start == slot_start.
+//   slot_body_end — AFTER the last token's IBGDA put, BEFORE the
+//                   slot-end __syncthreads()
+//   sync_start    — same program point as slot_body_end (write both)
+//   sync_end      — AFTER the slot-end __syncthreads() and AFTER the
+//                   atomic_clean_flag decrement, right BEFORE slot_end
+//   slot_end      — same as sync_end (write both; v2 keeps both to let a
+//                   v1-only analyzer still work)
+//
+// The timestamp pairs (sync_start, sync_end) and (slot_body_end, sync_start)
+// are intentionally redundant with the slot_body/slot boundaries; they let
+// a v1-only analyzer read slot_start/slot_end while a v2 analyzer reads
+// slot_body_*/sync_* for the finer decomposition.
+#define UCCL_EP_PROBE_SLOT_BODY_START(probe_ptr, sm_id, slot_iter)            \
+  do {                                                                        \
+    if ((probe_ptr) != nullptr && threadIdx.x == 0 &&                         \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs &&                               \
+        (slot_iter) < ::uccl::ep::probe::kMaxSlotsPerSM) {                    \
+      (probe_ptr)->slot_body_start[sm_id][slot_iter] = clock64();             \
+    }                                                                         \
+  } while (0)
+
+#define UCCL_EP_PROBE_SLOT_BODY_END(probe_ptr, sm_id, slot_iter)              \
+  do {                                                                        \
+    if ((probe_ptr) != nullptr && threadIdx.x == 0 &&                         \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs &&                               \
+        (slot_iter) < ::uccl::ep::probe::kMaxSlotsPerSM) {                    \
+      uint64_t now = clock64();                                               \
+      (probe_ptr)->slot_body_end[sm_id][slot_iter] = now;                     \
+      (probe_ptr)->sync_start[sm_id][slot_iter] = now;                        \
+    }                                                                         \
+  } while (0)
+
+#define UCCL_EP_PROBE_SYNC_END(probe_ptr, sm_id, slot_iter)                   \
+  do {                                                                        \
+    if ((probe_ptr) != nullptr && threadIdx.x == 0 &&                         \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs &&                               \
+        (slot_iter) < ::uccl::ep::probe::kMaxSlotsPerSM) {                    \
+      (probe_ptr)->sync_end[sm_id][slot_iter] = clock64();                    \
+    }                                                                         \
+  } while (0)
+
+// Called once by the first SM to advertise schema_version to the reader.
+#define UCCL_EP_PROBE_SCHEMA_V2(probe_ptr, sm_id)                             \
+  do {                                                                        \
+    if ((probe_ptr) != nullptr && (sm_id) == 0 && threadIdx.x == 0) {         \
+      (probe_ptr)->schema_version = 2;                                        \
+    }                                                                         \
+  } while (0)
+
 #else  // UCCL_EP_PROBE not defined
 
 #define UCCL_EP_PROBE_ENABLED 0
@@ -137,5 +220,9 @@ static_assert(sizeof(ProbeBuffer) % 64 == 0,
   ((void)0)
 #define UCCL_EP_PROBE_PUT_LAST(probe_ptr, sm_id, slot_iter, lane0_cond) \
   ((void)0)
+#define UCCL_EP_PROBE_SLOT_BODY_START(probe_ptr, sm_id, slot_iter) ((void)0)
+#define UCCL_EP_PROBE_SLOT_BODY_END(probe_ptr, sm_id, slot_iter) ((void)0)
+#define UCCL_EP_PROBE_SYNC_END(probe_ptr, sm_id, slot_iter) ((void)0)
+#define UCCL_EP_PROBE_SCHEMA_V2(probe_ptr, sm_id) ((void)0)
 
 #endif  // UCCL_EP_PROBE

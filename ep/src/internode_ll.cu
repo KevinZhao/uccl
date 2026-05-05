@@ -835,6 +835,9 @@ __global__ __launch_bounds__(1024, 1) void combine(
   // Only active under -DUCCL_EP_PROBE and when caller supplies a buffer.
   if constexpr (kOverlap) {
     UCCL_EP_PROBE_SM_START(probe_buffer, sm_id);
+    // Advertise v2 schema so readers can decode slot_body_* / sync_*
+    // fields. One-shot write from sm_id=0 lane 0, no visible cost.
+    UCCL_EP_PROBE_SCHEMA_V2(probe_buffer, sm_id);
   }
 #endif
 
@@ -1062,6 +1065,16 @@ __global__ __launch_bounds__(1024, 1) void combine(
     };
 #endif
 
+#if UCCL_EP_PROBE_ENABLED
+    // Probe v2: mark the start of the pure token pipeline, AFTER the
+    // per-slot mbarrier_init burst. Under K-1b+kOverlap there is no
+    // per-slot init so body_start ≈ slot_start; under Sprint A the gap
+    // (body_start - slot_start) = cost of the hoistable init block.
+    if constexpr (kOverlap) {
+      UCCL_EP_PROBE_SLOT_BODY_START(probe_buffer, sm_id, slot_iter);
+    }
+#endif
+
     // Issue IBGDA send
     for (int token_idx = offset + sub_warp_id;
          token_idx < offset + num_tokens_to_send;
@@ -1255,6 +1268,15 @@ __global__ __launch_bounds__(1024, 1) void combine(
       }
     }
 
+#if UCCL_EP_PROBE_ENABLED
+    // Probe v2: mark the end of the token pipeline body, BEFORE the
+    // finish-flag sync_barrier and slot-end __syncthreads(). Also writes
+    // sync_start as the same timestamp (the two regions are adjacent).
+    if constexpr (kOverlap) {
+      UCCL_EP_PROBE_SLOT_BODY_END(probe_buffer, sm_id, slot_iter);
+    }
+#endif
+
     // Put the finishing flag
     EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 16);
     sync_barrier<true>(warp_group_id + 1, num_warps_per_group * WARP_SIZE);
@@ -1307,9 +1329,14 @@ __global__ __launch_bounds__(1024, 1) void combine(
     if constexpr (kOverlap) {
       __syncthreads();
 #if UCCL_EP_PROBE_ENABLED
-      // Probe: slot wall-time window end — after syncthreads so that all
+      // Probe v1: slot wall-time window end — after syncthreads so that all
       // warps of this CTA are guaranteed past the finish-flag write.
       UCCL_EP_PROBE_SLOT_END(probe_buffer, sm_id, slot_iter);
+      // Probe v2: cost of (slot-end __syncthreads + atomic_clean_flag --) is
+      // sync_end - sync_start. sync_start was written by SLOT_BODY_END above
+      // at the point right BEFORE sync_barrier and __syncthreads; sync_end is
+      // now, right AFTER __syncthreads.
+      UCCL_EP_PROBE_SYNC_END(probe_buffer, sm_id, slot_iter);
 #endif
     }
 

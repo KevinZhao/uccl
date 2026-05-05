@@ -185,13 +185,22 @@ def aggregate(rows):
 def derive_indicators(cell_mechs):
     """Compute put_ratio, sm_overhead_ratio, sm_spread for one (ntok, nsms) cell.
 
-    Returns a dict with the three indicators and any missing-data notes.
-    Any indicator that can't be computed is set to None and a note is added.
+    When v2 probe fields (T_init, T_body, T_sync) are present, also compute
+    the T_slot decomposition shares (init_share, body_share, sync_share).
+    The v2 shares expose where slot-inter overhead actually lives: K-1b
+    attacks T_init; K-1a attacks T_body; the Sprint B probe overestimated
+    K-1b's ceiling because it lumped T_sync into the hoistable budget.
+
+    Returns a dict with indicators and any missing-data notes.
     """
     notes: list[str] = []
     put = cell_mechs.get("T_put")
     slot = cell_mechs.get("T_slot")
     sm = cell_mechs.get("T_sm")
+    # v2 fields; may be absent on older probe logs.
+    init = cell_mechs.get("T_init")
+    body = cell_mechs.get("T_body")
+    sync = cell_mechs.get("T_sync")
 
     # put_ratio
     put_ratio = None
@@ -223,11 +232,34 @@ def derive_indicators(cell_mechs):
     else:
         notes.append("sm_spread: missing T_sm p50 or max")
 
+    # v2 T_slot decomposition shares (fractions of slot mean time).
+    # init_share = T_init / T_slot  (mbarrier_init burst; hoistable by K-1b)
+    # body_share = T_body / T_slot  (token pipeline; attackable by K-1a)
+    # sync_share = T_sync / T_slot  (slot-end __syncthreads + finish-flag IBGDA;
+    #                                NOT hoistable by K-1b — this is the
+    #                                residual that Sprint B probe v1 lumped in)
+    init_share = None
+    body_share = None
+    sync_share = None
+    slot_mean = slot.get("mean") if slot else None
+    if slot_mean and slot_mean > 0:
+        if init and init.get("mean") is not None:
+            init_share = init["mean"] / slot_mean
+        if body and body.get("mean") is not None:
+            body_share = body["mean"] / slot_mean
+        if sync and sync.get("mean") is not None:
+            sync_share = sync["mean"] / slot_mean
+    if init is None and body is None and sync is None:
+        notes.append("v2 decomposition: no T_init/T_body/T_sync rows (v1 probe log)")
+
     return {
         "put_ratio": put_ratio,
         "sm_overhead_ratio": sm_overhead_ratio,
         "sm_spread": sm_spread,
         "n_slots_avg": n_slots_avg,
+        "init_share": init_share,
+        "body_share": body_share,
+        "sync_share": sync_share,
         "notes": notes,
     }
 
@@ -258,11 +290,23 @@ def _rule_k1a(ind):
 
 
 def _rule_k1b(ind):
+    """K-1b hoists mbarrier_init (T_init) out of the slot loop. Prefer the
+    v2 indicator `init_share` (direct measurement); fall back to v1's
+    `sm_overhead_ratio` for older probe logs. Sprint B K-1b A/B (2026-05-05)
+    showed sm_overhead_ratio > 1.30 was too loose — v1's threshold fired
+    on cells where T_init was only ~20% of T_slot and K-1b regressed decode
+    by 8%. Tighten: K-1b only recommended when init_share > 0.20 (v2) or
+    sm_overhead_ratio > 1.30 AND ntok > 256 (v1 fallback)."""
+    init_share = ind.get("init_share")
+    if init_share is not None:
+        fired = init_share > 0.20
+        return (fired, f"init_share={init_share:.3f} {'>' if fired else '<='} 0.20 (v2 direct)")
+    # v1 fallback (older probe logs without T_init)
     sor = ind["sm_overhead_ratio"]
     if sor is None:
-        return (False, "sm_overhead_ratio unavailable")
+        return (False, "both init_share and sm_overhead_ratio unavailable")
     fired = sor > SM_OVERHEAD_THRESHOLD
-    return (fired, f"sm_overhead_ratio={sor:.3f} {'>' if fired else '<='} {SM_OVERHEAD_THRESHOLD:.2f}")
+    return (fired, f"sm_overhead_ratio={sor:.3f} {'>' if fired else '<='} {SM_OVERHEAD_THRESHOLD:.2f} (v1 fallback)")
 
 
 def _rule_k1c(ind):
@@ -357,6 +401,7 @@ def print_aggregation_table(cells):
         f"{'T_sm.mean':>10} {'T_sm.max':>9} "
         f"{'n_slots':>8} "
         f"{'put_ratio':>10} {'sm_ovhd':>8} {'sm_sprd':>8} "
+        f"{'init%':>6} {'body%':>6} {'sync%':>6} "  # v2 shares; n/a on v1
         f"{'ranks':>6}"
     )
     print(hdr)
@@ -385,6 +430,9 @@ def print_aggregation_table(cells):
             f"{_fmt(ind['put_ratio']):>10} "
             f"{_fmt(ind['sm_overhead_ratio']):>8} "
             f"{_fmt(ind['sm_spread']):>8} "
+            f"{_fmt(ind['init_share'], '.1%'):>6} "
+            f"{_fmt(ind['body_share'], '.1%'):>6} "
+            f"{_fmt(ind['sync_share'], '.1%'):>6} "
             f"{ranks_str:>6}"
         )
     # Print any per-cell notes (missing-data) below the table.
