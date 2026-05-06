@@ -459,8 +459,36 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["baseline", "overlap", "both", "sweep", "workload", "probe"],
+        choices=["baseline", "overlap", "both", "sweep", "workload", "probe", "smoke"],
         default="both",
+    )
+    # Bench hygiene gates (task 2 follow-up to the 2026-05-05 40ms postmortem).
+    # When enabled (default), the smoke / workload / probe modes refuse to
+    # publish metrics if the pod is in the degraded-libfabric regime that
+    # produced the 40ms p99 readings on 2026-05-05. See
+    # efa-validation/results/stage5-p5en/ANALYSIS_40MS_POSTMORTEM.md.
+    parser.add_argument(
+        "--skip-smoke",
+        action="store_true",
+        help="Skip the pre-scan smoke check before workload/probe modes. "
+        "Only use when debugging the kernel itself; never in a session "
+        "whose numbers will inform PR / ship decisions.",
+    )
+    parser.add_argument(
+        "--smoke-p99-min-ratio-max",
+        type=float,
+        default=10.0,
+        help="Abort the session if median(p99) / median(min) on the smoke cell "
+        "exceeds this multiple. Normal sessions sit at ~2x, the 2026-05-05 "
+        "pathological pod was ~190x. Default 10x gives 5x headroom over normal.",
+    )
+    parser.add_argument(
+        "--smoke-p50-floor-us",
+        type=float,
+        default=1000.0,
+        help="Abort the session if median(p50) on the smoke cell (ntok=128, "
+        "nsms=22) exceeds this floor. Normal sessions see ~330us; the "
+        "pathological session saw ~18000us.",
     )
     parser.add_argument(
         "--probe-tokens",
@@ -521,6 +549,94 @@ def main():
         allow_nvlink_for_low_latency_mode=True,
         explicitly_destroy=True,
     )
+
+    def _run_smoke_gate():
+        """Quick health check at (ntok=128, nsms=22).
+
+        Two failure modes it catches:
+        - Degraded libfabric / IBGDA fallback path (2026-05-05 postmortem):
+          p50 explodes from ~330us to ~18000us, p99/min ratio goes from
+          ~2x to ~190x.
+        - Any other regression that kills fast-path latency on decode,
+          which is the tightest cell we measure.
+
+        Returns (passed: bool, summary_str: str) on every rank, but the
+        abort decision is made on rank 0 and broadcast via sys.exit so
+        all ranks die together instead of hanging in barrier.
+        """
+        ntok, nsms = 128, 22
+        x_w, topk_idx_w, topk_weights_w = build_inputs(
+            rank, ntok, args.hidden, args.num_topk, args.num_experts, device
+        )
+        dist.barrier()
+        # One combine-overlap cell is enough; the 2026-05-05 pathology
+        # lit up on every kernel uniformly so we don't need all three.
+        max_ntok_smoke = ntok
+        avg, p50, p99, p999, mn, mx = run_mode_one(
+            buffer, x_w, topk_idx_w, topk_weights_w,
+            max_ntok_smoke, args.num_experts,
+            overlap=True, num_sms=nsms,
+        )
+        dist.barrier()
+
+        ratio = p99 / mn if mn > 0 else float("inf")
+        details = (
+            f"SMOKE rank={rank} ntok={ntok} nsms={nsms} "
+            f"min={mn:.1f} p50={p50:.1f} p99={p99:.1f} "
+            f"p99_over_min={ratio:.1f}x"
+        )
+        _report(details)
+
+        ok_ratio = ratio <= args.smoke_p99_min_ratio_max
+        ok_p50 = p50 <= args.smoke_p50_floor_us
+        ok = ok_ratio and ok_p50
+
+        if not ok and rank == 0:
+            reason = []
+            if not ok_ratio:
+                reason.append(
+                    f"p99/min={ratio:.1f}x exceeds --smoke-p99-min-ratio-max="
+                    f"{args.smoke_p99_min_ratio_max}x"
+                )
+            if not ok_p50:
+                reason.append(
+                    f"p50={p50:.1f}us exceeds --smoke-p50-floor-us="
+                    f"{args.smoke_p50_floor_us}us"
+                )
+            _report(
+                "SMOKE_FAIL: " + "; ".join(reason) +
+                ". This matches the 2026-05-05 libfabric-degraded regime. "
+                "Check stderr for `NET/OFI` / `fi_getinfo` WARN lines. "
+                "DO NOT TRUST any metrics from this session. Re-deploy the "
+                "pod or abort. Override with --skip-smoke only when "
+                "debugging the kernel itself."
+            )
+        return ok, details
+
+    if args.mode == "smoke":
+        ok, _ = _run_smoke_gate()
+        dist.barrier()
+        if hasattr(buffer, "destroy"):
+            buffer.destroy()
+        destroy_uccl()
+        sys.exit(0 if ok else 2)
+
+    # Implicit smoke pre-scan for workload / probe: refuse to publish
+    # metrics if the pod is in the pathological regime. See
+    # efa-validation/results/stage5-p5en/ANALYSIS_40MS_POSTMORTEM.md.
+    if args.mode in ("workload", "probe") and not args.skip_smoke:
+        if rank == 0:
+            _report("SMOKE_PRE_SCAN: running gate before main bench")
+        ok, _ = _run_smoke_gate()
+        dist.barrier()
+        if not ok:
+            # All ranks exit together; don't fall through to real bench.
+            if hasattr(buffer, "destroy"):
+                buffer.destroy()
+            destroy_uccl()
+            sys.exit(2)
+        if rank == 0:
+            _report("SMOKE_PRE_SCAN: PASS, proceeding to main bench")
 
     if args.mode == "workload":
         # For each num_tokens × each num_sms: bench dispatch baseline, combine

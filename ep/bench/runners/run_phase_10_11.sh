@@ -54,6 +54,23 @@ run_both() {
   echo "[${label}] both ranks done"
 }
 
+# ---------- Phase 0: per-pod EFA / libfabric health check ----------------
+# Refuses to waste an entire GPU session on a pod whose libfabric
+# lost its EFA provider (2026-05-05 postmortem). Runs in ~100 ms.
+echo "=== $(date -u +%FT%TZ) Phase 0 verify_efa on both pods ==="
+for POD in "${NODE_R0}" "${NODE_R1}"; do
+  kubectl cp /tmp/verify_efa.sh "${POD}:/tmp/verify_efa.sh" 2>/dev/null || true
+  kubectl exec "${POD}" -- bash /tmp/verify_efa.sh \
+    > "${OUT_DIR}/verify-efa-${POD}.log" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "[verify_efa] FAIL on ${POD} (rc=${rc}). Aborting session."
+    cat "${OUT_DIR}/verify-efa-${POD}.log"
+    exit "$rc"
+  fi
+  echo "[verify_efa] ${POD}: $(cat "${OUT_DIR}/verify-efa-${POD}.log")"
+done
+
 # ---------- Phase 10.1: build adaptive-only .so on both nodes ------------
 echo "=== $(date -u +%FT%TZ) Phase 10.1 build (no probe) ==="
 for POD in "${NODE_R0}" "${NODE_R1}"; do
