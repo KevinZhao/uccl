@@ -1210,16 +1210,47 @@ __global__ __launch_bounds__(1024, 1) void combine(
     // decrement is visible before other warps start re-initializing
     // mbarriers. Legacy path only executes one iteration, so __syncwarp()
     // was enough — under SM-stripe we need the full-CTA barrier.
+    //
+    // K-T_sync (UCCL_EP_K_T_SYNC): the next slot's
+    // `cp.async.bulk.wait_group 0` + `__syncwarp()` (Sprint A H1 fix at the
+    // top of the slot loop body) already drain any pending TMA bulks
+    // per-warp before the new mbarrier_init. That drain is the actual
+    // guard for the phase-parity hazard. The slot-end __syncthreads()
+    // below adds nothing for correctness beyond what the H1 drain
+    // provides; it only blocks all 7 non-finish-flag warps on the single
+    // finish-flag writer lane (sub_warp_id==1 lane_id==0). Probe v2
+    // (2026-05-06) measured sync_share at 26-55% of T_slot. Remove the
+    // barrier under the flag so that the remaining warps can start the
+    // next slot's comp_signal spin and TMA pipeline concurrently with
+    // the finish-flag writer's remote IBGDA atomic.
+    //
+    // Invariants preserved when UCCL_EP_K_T_SYNC is on:
+    //   I1 — finish flag arrives at receiver after all token puts:
+    //        guarded by `sync_barrier<true>` above (warp_group-scoped
+    //        fence across all token-put warps of this group).
+    //   I2 — atomic_clean_flag counter is decremented exactly once per
+    //        slot: single writer lane, unchanged.
+    //   I3 — next slot's mbarrier_init does not collide with pending TMA
+    //        from this slot: the per-warp cp.async.bulk.wait_group 0 at
+    //        the top of the next iteration (H1 fix) drains its own
+    //        warp's pending bulks before touching the new mbarriers.
     if constexpr (kOverlap) {
+#ifndef UCCL_EP_K_T_SYNC
       __syncthreads();
+#endif
 #if UCCL_EP_PROBE_ENABLED
       // Probe v1: slot wall-time window end — after syncthreads so that all
       // warps of this CTA are guaranteed past the finish-flag write.
+      // Under K-T_sync we still write it here; the delta vs sync_start now
+      // reflects only the single finish-flag writer's latency + the
+      // sync_barrier. Analyzer interprets the drop in sync_share as
+      // evidence that the __syncthreads was the dominant cost.
       UCCL_EP_PROBE_SLOT_END(probe_buffer, sm_id, slot_iter);
       // Probe v2: cost of (slot-end __syncthreads + atomic_clean_flag --) is
       // sync_end - sync_start. sync_start was written by SLOT_BODY_END above
       // at the point right BEFORE sync_barrier and __syncthreads; sync_end is
-      // now, right AFTER __syncthreads.
+      // now, right AFTER __syncthreads (or after __syncwarp() only under
+      // UCCL_EP_K_T_SYNC).
       UCCL_EP_PROBE_SYNC_END(probe_buffer, sm_id, slot_iter);
 #endif
     }

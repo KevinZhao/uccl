@@ -246,6 +246,20 @@ if __name__ == "__main__":
             cxx_flags.append("-DUCCL_EP_PROBE")
             nvcc_flags.append("-DUCCL_EP_PROBE")
 
+        # K-T_sync (Sprint C): drop the slot-end __syncthreads() in the
+        # SM-stripe SEND kernel. Probe v2 (2026-05-06) showed the sync
+        # region (sync_barrier + finish-flag IBGDA atomic + slot-end
+        # __syncthreads) was 26-55% of T_slot, with the next slot's
+        # cp.async.bulk.wait_group 0 + __syncwarp() already guarding the
+        # TMA-into-newly-init-mbarrier hazard (Sprint A H1 fix). Opt-in so
+        # A/B vs the baseline SM-stripe path stays a one-flag toggle.
+        # Enable with `UCCL_EP_K_T_SYNC=1 python3 setup.py install`.
+        if int(os.getenv("UCCL_EP_K_T_SYNC", 0)):
+            print("Building with K-T_sync slot-end __syncthreads() removed "
+                  "(UCCL_EP_K_T_SYNC)")
+            cxx_flags.append("-DUCCL_EP_K_T_SYNC")
+            nvcc_flags.append("-DUCCL_EP_K_T_SYNC")
+
         # Add Intel RDMA NIC support: auto-detect irdma or USE_INTEL_RDMA_NIC=1
         use_intel_rdma_nic = os.getenv("USE_INTEL_RDMA_NIC")
         if use_intel_rdma_nic is None or use_intel_rdma_nic == "":
