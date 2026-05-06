@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)
 import analyze_probe  # noqa: E402
 
 
-_SCHEMA_RE = re.compile(r"PROBE_SCHEMA\s+version=(\d+)")
+_SCHEMA_RE = re.compile(r"PROBE_SCHEMA\s.*?version=(\d+)")
 
 
 def check_schema(paths):
