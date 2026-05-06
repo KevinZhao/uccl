@@ -287,6 +287,59 @@ Write `ANALYSIS_MECHANISM.md` alongside the logs, including:
   Sprint A's p99 on the same (ntok=128, num_sms=22) cell
 - Cost and session duration (timestamps from the log files)
 
+## Phase 0 — bench hygiene pre-flight (BLOCKING, every session)
+
+Lesson from the 2026-05-05 session (`ANALYSIS_40MS_POSTMORTEM.md`):
+a degraded libfabric / IBGDA submission path on one pod produced
+p99 ≈ 40 000 µs across every UCCL kernel, without any runtime error.
+Two days of "K-1b rejected" conclusions were derived from that
+contaminated data. Every GPU session now runs two independent gates
+before a single metric is published.
+
+### 0.1 Pod-side `verify_efa.sh` (pre-build)
+
+`runners/verify_efa.sh` shells out to `fi_info -p efa -l` and exits
+non-zero if libfabric has no EFA provider registered (the
+`fi_getinfo: No data available` signature). Runtime ~100 ms.
+
+`runners/run_phase_10_11.sh` calls this as **Phase 0** on both pods
+before the build step; a non-zero rc aborts the session without
+paying for the build.
+
+```bash
+# Manual invocation on a suspicious pod:
+kubectl exec <pod> -- bash /path/to/verify_efa.sh
+# PASS: VERIFY_EFA PASS providers=16 efa_devs=16
+# FAIL: VERIFY_EFA FAIL libfabric has no EFA provider registered
+```
+
+### 0.2 Bench-side smoke gate (implicit pre-scan)
+
+`bench_overlap.py` runs a one-cell smoke check at (ntok=128,
+num_sms=22) before every `--mode=workload` or `--mode=probe`
+invocation (unless `--skip-smoke` is passed). Two accept criteria:
+
+| gate | threshold | normal observed | pathological |
+|---|---|---|---|
+| `median(p99) / median(min)` | ≤ 10× | ~2× | ~190× (2026-05-05) |
+| `median(p50)` | ≤ 1000 µs | ~330 µs | ~18 000 µs (2026-05-05) |
+
+Both have 5× headroom over normal jitter. Fail → `sys.exit(2)` on
+every rank, logs labelled `SMOKE_FAIL` with the reason.
+
+```bash
+# Explicit smoke-only invocation (used by teardown / mid-session sanity):
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+  --master_addr=$MASTER --master_port=12360 \
+  bench_overlap.py --mode=smoke \
+    --hidden=7168 --num-topk=8 --num-experts=288 \
+    --num-rdma-bytes=$((20 * 1024**3))
+```
+
+`--skip-smoke` exists for kernel-debug sessions where the bench is
+known-broken; any numbers from such a session **must not** be used
+for PR / ship decisions.
+
 ## Phase 10/11 — probe v2 mechanism scan (replaces probe v1)
 
 Goal: capture T_slot decomposition into (T_init, T_body, T_sync) per
