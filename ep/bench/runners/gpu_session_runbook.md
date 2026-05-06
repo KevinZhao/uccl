@@ -389,6 +389,202 @@ and rerun Phase 4's probe scan. Expected signal: `sm_ovhd` drops from
 `__syncthreads()` between iterations may still be serializing — a
 K-1b follow-up.
 
+## Phase 10 — adaptive num_sms end-to-end validation (next session)
+
+Goal: prove that `low_latency_combine(num_sms=0)` dispatcher change in
+commit `7c925ea6` (Python-side adaptive tiers 22/22/48) preserves or
+beats Sprint A's best *static* choice at every workload cell, with zero
+> 3% regression anywhere in the grid.
+
+Why: the adaptive thresholds were derived from Sprint A's offline log,
+not from an in-situ A/B. We need one clean session where the exact
+same call site is run with (a) Sprint A default `num_sms=static`
+values and (b) adaptive `num_sms=0`, both compiled from the same
+commit, to rule out variance and confirm the tier boundaries.
+
+### 10.1 Two install prefixes (same .so, different call path)
+
+Only one build is needed — adaptive lives in Python. Install once:
+
+```bash
+cd /workspace/uccl/ep
+python3 setup.py install 2>&1 | tail -10
+```
+
+### 10.2 Grid A — static num_sms baseline (reproduces Sprint A numbers)
+
+```bash
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+  --master_addr=$MASTER --master_port=12355 \
+  bench_overlap.py --mode=workload \
+    --workload-tokens=128,256,384,512,768,1024 \
+    --workload-sms=22,48,96 \
+    --num-iters=20 \
+    --hidden=7168 --num-topk=8 --num-experts=288 \
+    --num-rdma-bytes=$((20 * 1024**3)) \
+  2> workload-static-r${R}.log
+```
+
+This yields 6 ntok × 3 nsms = 18 cells × 16 ranks × 20 iter.
+Note the new rows 384/768/1024 — they fill the tier boundaries so we
+can see the U-curve inside each tier (not just at the old 128/256/512
+sample points).
+
+### 10.3 Grid B — adaptive num_sms (num_sms=0)
+
+```bash
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+  --master_addr=$MASTER --master_port=12355 \
+  bench_overlap.py --mode=workload \
+    --workload-tokens=128,256,384,512,768,1024 \
+    --workload-sms=0 \
+    --num-iters=20 \
+    --hidden=7168 --num-topk=8 --num-experts=288 \
+    --num-rdma-bytes=$((20 * 1024**3)) \
+  2> workload-adaptive-r${R}.log
+```
+
+`--workload-sms=0` triggers `_pick_overlap_num_sms`; each of the 6
+ntok cells uses the tier lookup. Bench prints the actual resolved
+`num_sms` in the per-row `BENCH` line, so the log is self-documenting.
+
+### 10.4 Acceptance gates (computed offline, code-server side)
+
+For each ntok:
+
+| Gate | Rule |
+|---|---|
+| G1 — no regress vs best static | `p99(adaptive, ntok) ≤ min_{nsms∈{22,48,96}} p99(static, ntok, nsms) × 1.03` |
+| G2 — decode preserved | `p99(adaptive, 128) ≤ p99(static, 128, 96) × 0.75` (must keep the 29% Sprint A win) |
+| G3 — prefill preserved | `p99(adaptive, 512) ≤ p99(static, 512, 22) × 1.00` (must still beat the 512×22 case it was supposed to fix) |
+| G4 — interpolation sanity | `p99(adaptive, 384)` within ±5% of `min(p99(static, 384, 22), p99(static, 384, 48))` — confirms the (192,384] tier boundary is in a flat zone |
+
+If G1 fails at any ntok, the tier boundary is wrong; re-derive from
+this session's Grid A and land a follow-up PR before shipping
+adaptive. Do NOT change tier values mid-session — collect the data,
+teardown, decide offline.
+
+### 10.5 Output artifacts
+
+```
+stage5-p5en/sprint-b-adaptive-<STAMP>/
+  workload-static-r{0,1}.log         # raw bench logs
+  workload-adaptive-r{0,1}.log
+  ANALYSIS_ADAPTIVE.md                # G1–G4 results + decision
+  adaptive-grid.csv                   # ntok,cfg,p50,p99,p99.9,delta_vs_best
+```
+
+## Phase 11 — probe v2 data collection (next session, parallel to Phase 10)
+
+Goal: get `init_share / body_share / sync_share` per (ntok, num_sms)
+cell on a clean Sprint A kernel, so we know which *mechanism* to
+attack next. Probe v1 told us "slot-level overhead ~37%" but couldn't
+separate the hoistable init from the sticky sync; v2 resolves that.
+
+### 11.1 Build with probe v2 enabled
+
+```bash
+cd /workspace/uccl/ep
+python3 setup.py clean
+UCCL_EP_PROBE=1 python3 setup.py install 2>&1 | tail -10
+python3 -c "from uccl import ep; \
+  print(ep.probe_buffer_enabled(), ep.probe_buffer_bytes(), \
+        ep.probe_buffer_max_sms(), ep.probe_buffer_max_slots_per_sm())"
+```
+
+Expected: `True 526912 128 64` (v2 buffer is larger than v1's 264704
+due to the four new timestamp arrays + schema tag + padding).
+
+### 11.2 Gate B regression on probe v2 build (MUST PASS)
+
+```bash
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+  --master_addr=$MASTER --master_port=12355 \
+  tests/test_low_latency_overlap.py \
+    --num-experts=288 --hidden=7168 --num-topk=8 \
+    --num-sms-list=1,2,3,4,8,16,22,48,96 \
+  2> gate-b-probev2-r${R}.log
+grep -E "(PASS|FAIL|max diff|nonzero_frac)" gate-b-probev2-r${R}.log
+```
+
+Success: every rank/num_sms prints `max=0 nonzero_frac=0`. The v2
+macros are no-syncs-added (same 4 program points as v1), so the
+probability of a correctness regression is near zero — but Gate B is
+cheap and the signal is high.
+
+### 11.3 Probe v2 workload scan
+
+```bash
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+  --master_addr=$MASTER --master_port=12355 \
+  bench_overlap.py --mode=probe \
+    --probe-tokens=128,256,512 \
+    --probe-sms=22,48,96 \
+    --probe-iters=5 \
+    --hidden=7168 --num-topk=8 --num-experts=288 \
+    --num-rdma-bytes=$((20 * 1024**3)) \
+  2> probev2-r${R}.log
+
+echo "=== schema sanity ==="
+grep -E "^PROBE_SCHEMA" probev2-r${R}.log | head -2
+# Expected: PROBE_SCHEMA version=2 (at least one row per rank)
+
+grep -c "^PROBE " probev2-r${R}.log
+# Expected: 216 rows per log (8 ranks × 3 ntok × 3 nsms × 3 mechs)
+```
+
+### 11.4 Acceptance gates
+
+| Gate | Rule |
+|---|---|
+| P1 — schema | Every log contains `PROBE_SCHEMA version=2` |
+| P2 — non-trivial body | For every cell, `body_share > 0.20` (else the probe placement is wrong, not real mechanism data) |
+| P3 — init_share ordering | `init_share(128,22) > init_share(512,22)` — decode is init-heavy, prefill is body-heavy. If violated, the hoisted-init hypothesis from Sprint B probe v1 is wrong |
+| P4 — sync_share visibility | At least one cell has `sync_share ≥ 0.10` — if sync is always < 5% then K-1b's failure was purely register pressure, not T_sync residual |
+
+### 11.5 Offline analysis
+
+```bash
+python3 ~/workspace/uccl-ep-optimization/uccl/ep/bench/runners/analyze_probe.py \
+  probev2-r0.log probev2-r1.log > analyze_probev2_out.txt
+cat analyze_probev2_out.txt
+```
+
+Output should end with one of:
+- `==> NEXT KERNEL CHANGE: K-1a (hoist mbarrier_init only, no persistent phase)` — if init_share is the top contributor AND K-1b's regression was driven by persistent-phase register cost
+- `==> NEXT KERNEL CHANGE: K-T_sync (overlap finish-flag atomic with next slot)` — if sync_share dominates
+- `==> NEXT KERNEL CHANGE: K-1c (larger slot pipelining)` — if body_share is flat but aggregate is still NIC-bound (put_ratio > 0.7)
+
+### 11.6 Output artifacts
+
+```
+stage5-p5en/sprint-b-probev2-<STAMP>/
+  probev2-r{0,1}.log
+  gate-b-probev2-r{0,1}.log
+  analyze_probev2_out.txt
+  ANALYSIS_PROBE_V2.md       # init/body/sync decomposition + next-kernel decision
+```
+
+## Phase 10/11 combined session flow
+
+Because adaptive is pure-Python and probe v2 is a separate build, the
+cleanest single-session layout is:
+
+1. Phase 1 — start cluster, verify leaf.
+2. Phase 10.1 — one clean build (no probe).
+3. Phase 10.2 + 10.3 — Grid A + Grid B under same .so (same
+   `torchrun` pair, different `--workload-sms`).
+4. `python3 setup.py clean` — tear down .so to avoid cache collision.
+5. Phase 11.1 — probe v2 build.
+6. Phase 11.2 — Gate B on probe v2 build.
+7. Phase 11.3 — probe scan.
+8. Phase 6 — scp all 8 logs out.
+9. Phase 7 — teardown.
+
+Step 4 is the one trap: `setup.py install` with a different
+`UCCL_EP_PROBE` must not share the build cache, else probe macros
+won't actually fire. The `clean` between builds is mandatory.
+
 ## Total session budget
 
 | Phase | Duration | Cost (p5en spot ~$8/hr × 2 nodes) |
@@ -401,8 +597,11 @@ K-1b follow-up.
 | 6 scp | ~2 min | $0.53 |
 | 7 teardown | ~3 min | ~$0 |
 | 9 K-1b A/B (Phase 9 = 2 builds + Gate B + 2 workload runs) | ~35 min | ~$9.30 |
+| 10 adaptive A/B (1 build + 2 workload grids, 6×3 + 6×1 cells) | ~22 min | ~$5.90 |
+| 11 probe v2 (1 build + Gate B + probe scan) | ~20 min | ~$5.30 |
 | **Total (probe only)** | **~50 min** | **~$16** |
 | **Total (K-1b A/B session, Phase 1+9+6+7)** | **~60 min** | **~$19** |
+| **Total (adaptive + probe v2, Phase 1+10+11+6+7)** | **~70 min** | **~$19** |
 
 If any phase exits non-zero and can't be recovered in 3 min, skip to
 Phase 7. Don't let the spot burn while you debug.
