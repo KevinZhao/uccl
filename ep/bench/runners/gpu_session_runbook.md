@@ -287,6 +287,97 @@ Write `ANALYSIS_MECHANISM.md` alongside the logs, including:
   Sprint A's p99 on the same (ntok=128, num_sms=22) cell
 - Cost and session duration (timestamps from the log files)
 
+## Phase 10/11 — probe v2 mechanism scan (replaces probe v1)
+
+Goal: capture T_slot decomposition into (T_init, T_body, T_sync) per
+(ntok, num_sms) cell so the next kernel variant can be picked from
+measured shares rather than v1's lumped slot_ovhd estimate.
+
+The 2026-05-06 apne1 session using this flow produced the per-cell
+shares recorded in `efa-validation/results/stage5-p5en/
+sprint-b-adaptive-probev2-20260506T023000Z/ANALYSIS.md` — body
+dominated at 82–94 %, init sat at 3–11 %, sync at 26–55 %. Those
+numbers obsolete the Sprint B probe v1 reading that motivated the
+K-1b (init-hoist) direction; that kernel variant is therefore *not*
+carried on this branch.
+
+### 10.1 Build
+
+```bash
+cd /workspace/uccl/ep
+python3 setup.py clean
+TORCH_CUDA_ARCH_LIST=9.0 UCCL_EP_PROBE=1 python3 setup.py install 2>&1 | tail -5
+python3 -c "from uccl import ep; \
+  print(ep.probe_buffer_enabled(), ep.probe_buffer_bytes())"
+# Expected: True 526912  (v2 buffer size)
+```
+
+The `TORCH_CUDA_ARCH_LIST=9.0` override is required on nvcr 25.10-py3
+images where `nvidia-smi` is not wired up and torch's autodetect
+otherwise emits `compute_75` PTX that ptxas rejects for the Hopper
+intrinsics used in the SM-stripe kernel.
+
+### 10.2 Static-grid workload scan
+
+```bash
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+  --master_addr=$MASTER --master_port=12360 \
+  bench_overlap.py --mode=workload \
+    --workload-tokens=128,256,384,512,768,1024 \
+    --workload-sms=22,48,96 \
+    --num-iters=20 \
+    --hidden=7168 --num-topk=8 --num-experts=288 \
+    --num-rdma-bytes=$((20 * 1024**3)) \
+  2> workload-static-r${R}.log
+```
+
+Expected row count per rank: 6 ntok × (1 dispatch + 1 combine-base +
+3 combine-overlap) × 20 iter = 600.
+
+### 10.3 Probe v2 scan
+
+```bash
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+  --master_addr=$MASTER --master_port=12362 \
+  bench_overlap.py --mode=probe \
+    --probe-tokens=128,256,512 \
+    --probe-sms=22,48,96 \
+    --probe-iters=5 \
+    --hidden=7168 --num-topk=8 --num-experts=288 \
+    --num-rdma-bytes=$((20 * 1024**3)) \
+  2> probev2-r${R}.log
+
+grep "^PROBE_SCHEMA" probev2-r${R}.log | head -1
+# Expected: PROBE_SCHEMA ntok=128 nsms=22 version=2 (rank 0 only)
+grep -c "^PROBE " probev2-r${R}.log
+# Expected: 216 per rank = 8 × 3 × 3 × 3 mechs (v1) + 3 extra v2 mechs
+# Observed 2026-05-06: 432 per log (two ranks contributing)
+```
+
+### 10.4 Acceptance gates (offline)
+
+| Gate | Rule |
+|---|---|
+| P1 | At least one log has `PROBE_SCHEMA version=2` (rank-0 only field) |
+| P2 | Every cell has `body_share > 0.20` — else probe placement is wrong |
+| P3 | `init_share(128,22) > init_share(512,22)` — decode is init-heavier |
+| P4 | `max sync_share >= 0.10` across cells — sync is attackable |
+
+Gate evaluator: `runners/gate_probev2.py probev2-r{0,1}.log`.
+
+### 10.5 Deciding the next kernel variant
+
+Read `body/init/sync` shares:
+
+- `init_share` ≥ 20 % and dominates → K-1a (pure mbarrier_init hoist,
+  no persistent phase; K-1b's register-pressure trap avoided)
+- `sync_share` ≥ 20 % and attackable → K-T_sync (overlap finish-flag
+  IBGDA atomic with next slot body)
+- `body_share` is everything (> 80 %) and `put_ratio > 0.7` → K-1c
+  (larger slot pipelining)
+
+2026-05-06 data pointed at K-T_sync (sync 26–55 %, init 3–11 %).
+
 ## Total session budget
 
 | Phase | Duration | Cost (p5en spot ~$8/hr × 2 nodes) |
