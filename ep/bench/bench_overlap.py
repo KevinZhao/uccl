@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from buffer import Buffer
+from buffer import Buffer, _pick_overlap_num_sms
 from utils import bench, init_dist_under_torchrun, destroy_uccl
 
 
@@ -569,7 +569,10 @@ def main():
                     f"num_tokens={ntok} num_sms=0 avg={avg:.2f} p50={p50:.2f} "
                     f"p99={p99:.2f} p999={p999:.2f} min={mn:.2f} max={mx:.2f}"
                 )
-                # Combine overlap swept across all num_sms in sms_list
+                # Combine overlap swept across all num_sms in sms_list.
+                # nsms=0 activates the adaptive dispatcher in Buffer; we also
+                # log the resolved value so downstream analysis can tell which
+                # tier fired (e.g. ntok=128,nsms=0 resolves to 22).
                 for nsms in sms_list:
                     dist.barrier()
                     avg, p50, p99, p999, mn, mx = run_mode_one(
@@ -582,10 +585,13 @@ def main():
                         overlap=True,
                         num_sms=nsms,
                     )
+                    resolved = nsms if nsms > 0 else _pick_overlap_num_sms(ntok)
+                    tag = f"adapt{resolved}" if nsms == 0 else f"{nsms}"
                     _report(
                         f"BENCH rank={rank} iter={iteration} "
-                        f"mode=combine-overlap-{nsms} "
+                        f"mode=combine-overlap-{tag} "
                         f"num_tokens={ntok} num_sms={nsms} "
+                        f"resolved_sms={resolved} "
                         f"avg={avg:.2f} p50={p50:.2f} p99={p99:.2f} "
                         f"p999={p999:.2f} min={mn:.2f} max={mx:.2f}"
                     )
