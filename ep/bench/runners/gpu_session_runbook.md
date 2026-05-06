@@ -431,6 +431,147 @@ Read `body/init/sync` shares:
 
 2026-05-06 data pointed at K-T_sync (sync 26–55 %, init 3–11 %).
 
+## Phase 12 — K-T_sync A/B session (acceptance for the kernel variant)
+
+Goal: decide whether to keep the `UCCL_EP_K_T_SYNC` kernel variant on
+the SM-stripe branch by running it head-to-head against the same
+commit with the flag off. No decision gets made from code review
+alone — probe v2 already told us the sync region is 26–55 % of slot
+time, but the actual `__syncthreads()` contribution within that
+region is only knowable from hardware.
+
+### 12.1 Two builds on the same commit (one branch)
+
+Both configs come from `feat/k-t-sync` tip. Build and install into
+separate site-packages paths so A/B swaps do not require a rebuild:
+
+```bash
+cd /workspace/uccl/ep
+# Baseline: same as feat/sm-stripe-overlap, no K-T_sync flag
+python3 setup.py clean
+TORCH_CUDA_ARCH_LIST=9.0 python3 setup.py install --prefix=/workspace/install-baseline 2>&1 | tail -5
+
+# K-T_sync variant
+python3 setup.py clean
+TORCH_CUDA_ARCH_LIST=9.0 UCCL_EP_K_T_SYNC=1 python3 setup.py install --prefix=/workspace/install-ktsync 2>&1 | tail -5
+
+# Probe build (UCCL_EP_K_T_SYNC=1 UCCL_EP_PROBE=1) for mechanism-level A/B
+python3 setup.py clean
+TORCH_CUDA_ARCH_LIST=9.0 UCCL_EP_K_T_SYNC=1 UCCL_EP_PROBE=1 python3 setup.py install --prefix=/workspace/install-ktsync-probe 2>&1 | tail -5
+```
+
+Flip between builds by prepending the install prefix to PYTHONPATH
+(`PYTHONPATH=/workspace/install-ktsync/lib/python3.12/site-packages` etc.).
+
+### 12.2 Gate B regression on the K-T_sync build (BLOCKING)
+
+```bash
+PYTHONPATH=/workspace/install-ktsync/lib/python3.12/site-packages \
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+  --master_addr=$MASTER --master_port=12360 \
+  tests/test_low_latency_overlap.py \
+    --num-experts=288 --hidden=7168 --num-topk=8 \
+    --num-sms-list=1,2,3,4,8,16,22,48,96 \
+  2> gateB-ktsync-r${R}.log
+
+grep -E "max diff|nonzero_frac|PASS|FAIL" gateB-ktsync-r${R}.log | head -20
+```
+
+Success criterion: every (rank, num_sms) prints `max=0
+nonzero_frac=0`. Any nonzero is an I1 / I2 / I3 violation — stop the
+session, revert `f57159cc`, investigate which invariant broke.
+
+### 12.3 Workload A/B grid
+
+Same grid as `workload-static` in Phase 10.2 (128/256/384/512/768/1024
+× 22/48/96 × 20 iter) so the result is directly comparable to the
+`feat/sm-stripe-overlap` smoke numbers (`sprint-b-smoke-20260506T093000Z`)
+and the earlier session (`sprint-b-adaptive-probev2-20260506T023000Z`).
+
+```bash
+for VARIANT in baseline ktsync; do
+  PYTHONPATH=/workspace/install-${VARIANT}/lib/python3.12/site-packages \
+  torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+    --master_addr=$MASTER --master_port=12360 \
+    bench_overlap.py --mode=workload \
+      --workload-tokens=128,256,384,512,768,1024 \
+      --workload-sms=22,48,96 \
+      --num-iters=20 \
+      --hidden=7168 --num-topk=8 --num-experts=288 \
+      --num-rdma-bytes=$((20 * 1024**3)) \
+    2> workload-${VARIANT}-r${R}.log
+done
+```
+
+### 12.4 Probe v2 A/B — which piece of sync_share actually shrank
+
+```bash
+PYTHONPATH=/workspace/install-ktsync-probe/lib/python3.12/site-packages \
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=$R \
+  --master_addr=$MASTER --master_port=12362 \
+  bench_overlap.py --mode=probe \
+    --probe-tokens=128,256,512 \
+    --probe-sms=22,48,96 \
+    --probe-iters=5 \
+    --hidden=7168 --num-topk=8 --num-experts=288 \
+    --num-rdma-bytes=$((20 * 1024**3)) \
+  2> probev2-ktsync-r${R}.log
+```
+
+Compare cell-by-cell against `sprint-b-adaptive-probev2-20260506T023000Z/
+probev2-r{0,1}.log` via `gate_probev2.py`. Expected signature of
+K-T_sync working:
+
+- `sync_share(128,22)`: drops from **51.7 %** toward 15–25 %
+- `body_share(128,22)`: rises from 82.8 % toward 85-92 %
+- `init_share(128,22)`: unchanged (~11 %, K-T_sync doesn't touch this)
+
+### 12.5 Acceptance gates (all required for ship)
+
+| gate | rule | notes |
+|---|---|---|
+| **K1 correctness** | Gate B `max=0 nonzero_frac=0` across all cells | BLOCKING; any nonzero ⇒ revert |
+| **K2 no regression** | No workload cell's K-T_sync median p99 > 1.03 × baseline | avoid net-negative variants like K-1b was |
+| **K3 meaningful gain** | At least one cell shows K-T_sync median p99 ≤ 0.90 × baseline | ≥10 % improvement somewhere — otherwise the removed barrier was not the bottleneck |
+| **K4 mechanism match** | Probe v2 `sync_share` at (128,22) drops by ≥ 20 percentage points | confirms the `__syncthreads()` was the dominant sync cost, not sync_barrier or the atomic |
+
+If K1 fails → revert the commit, open an issue with the failing cell
+and the raw max-diff number.
+
+If K2 or K3 fails but K1 passes → the code is correct but the speed
+win is not where we expected. Do not ship; reassess whether
+`sync_barrier<true>` or the remote IBGDA atomic is the real cost
+(those are the next targets, not `__syncthreads()`).
+
+If K4 is ambiguous (sync_share drops only 5–15 pp) → ship K-T_sync
+only if K3 still fires; otherwise treat the commit as a bench
+artefact and keep looking.
+
+### 12.6 Output artefacts
+
+```
+stage5-p5en/sprint-c-ktsync-<STAMP>/
+  gateB-ktsync-r{0,1}.log
+  workload-baseline-r{0,1}.log        # headline A/B for K2 / K3
+  workload-ktsync-r{0,1}.log
+  probev2-ktsync-r{0,1}.log           # K4 mechanism check
+  ANALYSIS_KTSYNC.md                  # gate verdict + next step
+  ktsync-grid.csv                     # per-cell p99 delta
+```
+
+### 12.7 Session budget
+
+One session ≈ **~35 min / ≈ \$9**:
+- 2 min — scale NG + leaf verify
+- 9 min — 3 builds (baseline / ktsync / ktsync+probe)
+- 3 min — Gate B
+- 8 min — workload A/B (2 × 6 × 3 cells)
+- 6 min — probe v2 scan
+- 5 min — scp + teardown
+
+Same spot discipline as previous sessions: teardown fires immediately
+after `scp`, verify `State=shutting-down` before walking away.
+
 ## Total session budget
 
 | Phase | Duration | Cost (p5en spot ~$8/hr × 2 nodes) |
