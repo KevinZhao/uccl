@@ -58,16 +58,49 @@ struct ProbeBuffer {
   // v2 adds two pairs to separate (b) from (c). The (a) region is the span
   // between slot_start and slot_body_start, so it's derivable without a
   // fifth pair. All v2 writes hit the same call sites as v1, no new syncs.
+  //
+  // NOTE on sync_start/sync_end (IMPORTANT for readers):
+  // Sprint C 2026-05-06 K-T_sync A/B session empirically showed that the
+  // sync_start→sync_end window measures writer-lane IBGDA-atomic RTT, not
+  // blocking time on non-writer warps. The v3 schema retains these field
+  // names for backward compatibility but the analyzer should label the
+  // derived metric "T_finish_flag" rather than "T_sync", and it should
+  // NOT be reported as an attackable fraction. See docs/PROBE_V3_DESIGN.md.
   uint64_t slot_body_start[kMaxSMs][kMaxSlotsPerSM];  // after per-slot init
   uint64_t slot_body_end[kMaxSMs][kMaxSlotsPerSM];    // before slot-end sync
   uint64_t sync_start[kMaxSMs][kMaxSlotsPerSM];       // same as slot_body_end
+                                                      // (v3: finish_flag_start)
   uint64_t sync_end[kMaxSMs][kMaxSlotsPerSM];         // same as slot_end
+                                                      // (v3: finish_flag_end)
 
-  // Schema tag. Writer sets 2 when v2 macros are active; callers/analyzers
-  // inspect this to know which fields are populated. Zero → no probe wrote
-  // anything (buffer stale or disabled), nonzero → at least v1.
+  // v3 fields (Sprint C+ planning) -----------------------------------------
+  // v2 timed SEND phase only and missed the `while (rdma_recv_flag == 0)`
+  // spin in RECV phase — the actual cross-rank critical path. K-T_sync
+  // landed with sync_share 26-55% → 0.8-2.3% per probe v2 but workload p99
+  // moved ±3%, consistent with RECV wait dominating T_kernel.
+  //
+  // v3 adds three timestamps per RECV iteration. Indexing is per-(SM,
+  // recv_slot_iter) where recv_slot_iter is a fresh 0-based counter for
+  // the RECV phase (independent from SEND's slot_iter because RECV uses
+  // a different responsible_expert_idx mapping).
+  uint64_t recv_wait_start[kMaxSMs][kMaxSlotsPerSM];   // entry to RECV spin
+  uint64_t recv_wait_end[kMaxSMs][kMaxSlotsPerSM];     // flag arrived, exit spin
+  uint64_t recv_reduce_end[kMaxSMs][kMaxSlotsPerSM];   // after local reduction
+  // Which peer rank each RECV slot was waiting on. Lets the analyzer
+  // answer "is the tail always coming from the same slow peer?"
+  int32_t recv_src_rank[kMaxSMs][kMaxSlotsPerSM];
+  // Number of RECV iterations each SM actually processed (parallel to
+  // n_slots for SEND phase).
+  int32_t n_recv_slots[kMaxSMs];
+
+  // Schema tag. Writer sets:
+  //   1 — v1 (Sprint B probe)
+  //   2 — v2 (Sprint C planning; adds slot_body_*/sync_*)
+  //   3 — v3 (Sprint C+; adds recv_*)
+  // Analyzers must gate on schema_version and degrade gracefully for
+  // older buffers. Zero → no probe wrote anything.
   int32_t schema_version;
-  int32_t _pad_for_64B_alignment[15];  // schema_version + pad = 64 B → total stays 64B-aligned
+  int32_t _pad_for_64B_alignment[15];  // keep total 64B-aligned (756800B)
 };
 
 static_assert(sizeof(ProbeBuffer) % 64 == 0,
@@ -201,10 +234,68 @@ static_assert(sizeof(ProbeBuffer) % 64 == 0,
   } while (0)
 
 // Called once by the first SM to advertise schema_version to the reader.
+// v3 supersedes v2 (schema_version=3 implies all v2 fields are also
+// populated, plus the RECV fields). Analyzers reading schema_version=2
+// see only SEND-phase fields.
 #define UCCL_EP_PROBE_SCHEMA_V2(probe_ptr, sm_id)                             \
   do {                                                                        \
     if ((probe_ptr) != nullptr && (sm_id) == 0 && threadIdx.x == 0) {         \
       (probe_ptr)->schema_version = 2;                                        \
+    }                                                                         \
+  } while (0)
+
+#define UCCL_EP_PROBE_SCHEMA_V3(probe_ptr, sm_id)                             \
+  do {                                                                        \
+    if ((probe_ptr) != nullptr && (sm_id) == 0 && threadIdx.x == 0) {         \
+      (probe_ptr)->schema_version = 3;                                        \
+    }                                                                         \
+  } while (0)
+
+// v3 macros — RECV phase timing. Called with the same lane-0 gate as the
+// existing RECV spin block in internode_ll.cu combine kernel.
+//
+// Placement guide (internode_ll.cu RECV phase):
+//   UCCL_EP_PROBE_RECV_WAIT_START — immediately before the
+//     `while (ld_acquire_sys_global(rdma_recv_flag + ...) == 0)` spin;
+//     also writes recv_src_rank (caller passes the computed src_rank).
+//   UCCL_EP_PROBE_RECV_WAIT_END — after the spin exits (remote flag arrived).
+//   UCCL_EP_PROBE_RECV_REDUCE_END — after the local receive-side reduction
+//     finishes. The gap wait_end→reduce_end is pure local work.
+#define UCCL_EP_PROBE_RECV_WAIT_START(probe_ptr, sm_id, recv_iter, src_rank)  \
+  do {                                                                        \
+    if ((probe_ptr) != nullptr &&                                             \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs &&                               \
+        (recv_iter) < ::uccl::ep::probe::kMaxSlotsPerSM) {                    \
+      (probe_ptr)->recv_wait_start[sm_id][recv_iter] = clock64();             \
+      (probe_ptr)->recv_src_rank[sm_id][recv_iter] = (src_rank);              \
+    }                                                                         \
+  } while (0)
+
+#define UCCL_EP_PROBE_RECV_WAIT_END(probe_ptr, sm_id, recv_iter)              \
+  do {                                                                        \
+    if ((probe_ptr) != nullptr &&                                             \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs &&                               \
+        (recv_iter) < ::uccl::ep::probe::kMaxSlotsPerSM) {                    \
+      (probe_ptr)->recv_wait_end[sm_id][recv_iter] = clock64();               \
+    }                                                                         \
+  } while (0)
+
+#define UCCL_EP_PROBE_RECV_REDUCE_END(probe_ptr, sm_id, recv_iter)            \
+  do {                                                                        \
+    if ((probe_ptr) != nullptr &&                                             \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs &&                               \
+        (recv_iter) < ::uccl::ep::probe::kMaxSlotsPerSM) {                    \
+      (probe_ptr)->recv_reduce_end[sm_id][recv_iter] = clock64();             \
+    }                                                                         \
+  } while (0)
+
+// Record how many RECV iterations this SM completed. Fires once at
+// RECV phase exit on lane 0 of the owning warp.
+#define UCCL_EP_PROBE_N_RECV_SLOTS(probe_ptr, sm_id, n_recv_done)             \
+  do {                                                                        \
+    if ((probe_ptr) != nullptr &&                                             \
+        (sm_id) < ::uccl::ep::probe::kMaxSMs) {                               \
+      (probe_ptr)->n_recv_slots[sm_id] = (n_recv_done);                       \
     }                                                                         \
   } while (0)
 
@@ -224,5 +315,11 @@ static_assert(sizeof(ProbeBuffer) % 64 == 0,
 #define UCCL_EP_PROBE_SLOT_BODY_END(probe_ptr, sm_id, slot_iter) ((void)0)
 #define UCCL_EP_PROBE_SYNC_END(probe_ptr, sm_id, slot_iter) ((void)0)
 #define UCCL_EP_PROBE_SCHEMA_V2(probe_ptr, sm_id) ((void)0)
+#define UCCL_EP_PROBE_SCHEMA_V3(probe_ptr, sm_id) ((void)0)
+#define UCCL_EP_PROBE_RECV_WAIT_START(probe_ptr, sm_id, recv_iter, src_rank) \
+  ((void)0)
+#define UCCL_EP_PROBE_RECV_WAIT_END(probe_ptr, sm_id, recv_iter) ((void)0)
+#define UCCL_EP_PROBE_RECV_REDUCE_END(probe_ptr, sm_id, recv_iter) ((void)0)
+#define UCCL_EP_PROBE_N_RECV_SLOTS(probe_ptr, sm_id, n_recv_done) ((void)0)
 
 #endif  // UCCL_EP_PROBE

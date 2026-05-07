@@ -1244,6 +1244,14 @@ LOW_LATENCY_COMBINE_RECV:
     if (sub_warp_id == 0 and lane_id == 0) {
       auto const src_rank = responsible_expert_idx / num_local_experts;
       auto start_time = clock64();
+#if UCCL_EP_PROBE_ENABLED
+      // Probe v3: mark RECV spin entry. recv_iter = warp_group_id because
+      // each warp group on this SM owns exactly one responsible_expert_idx.
+      if constexpr (kOverlap) {
+        UCCL_EP_PROBE_RECV_WAIT_START(probe_buffer, sm_id, warp_group_id,
+                                      src_rank);
+      }
+#endif
       while ((src_rank / max_nvl_peers == rank / max_nvl_peers) &&
              ld_acquire_sys_global<kUseAggressiveAtomic>(
                  rdma_recv_flag + responsible_expert_idx) == 0)
@@ -1292,6 +1300,13 @@ LOW_LATENCY_COMBINE_RECV:
                       combine_wait_recv_cost_stats + src_rank),
                   wait_recv_cost);
       }
+#if UCCL_EP_PROBE_ENABLED
+      // Probe v3: RECV spin exited. Time from RECV_WAIT_START to here is
+      // the actual cross-rank critical-path stall for this expert slot.
+      if constexpr (kOverlap) {
+        UCCL_EP_PROBE_RECV_WAIT_END(probe_buffer, sm_id, warp_group_id);
+      }
+#endif
     }
   }
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
@@ -1353,6 +1368,25 @@ LOW_LATENCY_COMBINE_RECV:
     // if (blockIdx.x == 0 && threadIdx.x == 0)
     //   printf("[combine] RECV finished\n");
   }
+
+#if UCCL_EP_PROBE_ENABLED
+  // Probe v3: RECV reduce complete. Time from RECV_WAIT_END to here is
+  // local reduction work (not cross-rank). Fire once per warp group from
+  // the same lane-0 gate that wrote RECV_WAIT_*, so every warp group that
+  // actually entered the RECV phase records a reduce_end. Also advertise
+  // schema_version=3 from SM 0 and stamp n_recv_slots per SM.
+  if constexpr (kOverlap) {
+    if (responsible_expert_idx < num_experts &&
+        sub_warp_id == 0 && lane_id == 0) {
+      UCCL_EP_PROBE_RECV_REDUCE_END(probe_buffer, sm_id, warp_group_id);
+    }
+    if (threadIdx.x == 0) {
+      // Each SM hosts num_warp_groups RECV iterations (one per warp group).
+      UCCL_EP_PROBE_N_RECV_SLOTS(probe_buffer, sm_id, num_warp_groups);
+    }
+    UCCL_EP_PROBE_SCHEMA_V3(probe_buffer, sm_id);
+  }
+#endif
 }
 
 void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,

@@ -82,14 +82,22 @@ def _alloc_probe_buffer(device):
 def _parse_probe_buffer(buf: torch.Tensor) -> dict:
     """Reinterpret the raw uint8 probe buffer into the ProbeBuffer layout.
 
-    Layout must stay in sync with combine_probe.cuh. v1 fields
-    (sm_start/sm_end, slot_start/slot_end, put_start/put_end, n_slots)
-    are always present. v2 fields (slot_body_start/slot_body_end,
-    sync_start/sync_end, schema_version) are present if the extension
-    was built at v2 size (≈ 527 KB) and populated when schema_version==2.
-    We detect the v2 size via probe_buffer_bytes().
+    Layout must stay in sync with combine_probe.cuh. Three schema versions:
+      v1: sm_start/sm_end, slot_start/slot_end, put_start/put_end, n_slots
+          (≈ 264 704 B total)
+      v2: v1 + slot_body_start/slot_body_end/sync_start/sync_end + schema_version
+          (≈ 526 912 B total, schema_version at buffer end)
+      v3: v1 + v2 fields + recv_wait_start/recv_wait_end/recv_reduce_end
+          + recv_src_rank + n_recv_slots + schema_version
+          (≈ 756 800 B total)
 
-    All timestamp fields are uint64; n_slots and schema_version are int32.
+    We detect the layout from the total buffer size. schema_version sits
+    at a different offset in v2 vs v3 builds, so a v2-size parser on a
+    v3 binary would read garbage. Each build's ABI size is fixed at
+    compile time and queryable via ep.probe_buffer_bytes().
+
+    All timestamp fields are uint64; n_slots / n_recv_slots / src_rank /
+    schema_version are int32.
     """
     max_sms = ep.probe_buffer_max_sms()
     max_slots = ep.probe_buffer_max_slots_per_sm()
@@ -108,7 +116,7 @@ def _parse_probe_buffer(buf: torch.Tensor) -> dict:
         offset += count * 4
         return view.numpy().astype("int32")
 
-    # v1 fields (always present)
+    # v1 fields (always present) -------------------------------------------
     sm_start = take_u64(max_sms)
     sm_end = take_u64(max_sms)
     slot_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
@@ -128,21 +136,44 @@ def _parse_probe_buffer(buf: torch.Tensor) -> dict:
         schema_version=1,
     )
 
-    # v2 fields (present if buffer is large enough — v2 size ≈ 2× v1).
-    # v1 size = kMaxSMs*(16 + 8*4*kMaxSlotsPerSM + 4) ≈ 264 704 B.
-    # v2 adds 4 more [kMaxSMs][kMaxSlotsPerSM] uint64 arrays + int32 header.
-    v2_extra = 4 * max_sms * max_slots * 8 + 64  # 64 = schema region block
-    if host.numel() >= offset + v2_extra:
-        slot_body_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
-        slot_body_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
-        sync_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
-        sync_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
-        schema_version = int(take_i32(1)[0])
-        out["slot_body_start"] = slot_body_start
-        out["slot_body_end"] = slot_body_end
-        out["sync_start"] = sync_start
-        out["sync_end"] = sync_end
-        out["schema_version"] = schema_version
+    total_bytes = host.numel()
+    v1_bytes = offset
+    # Estimated layout sizes (must match C++ sizeof(ProbeBuffer)).
+    # v2 = v1 + 4 * kMaxSMs*kMaxSlotsPerSM * 8 + 64 (schema_version + pad).
+    # v3 = v2 - 64 + 3 * kMaxSMs*kMaxSlotsPerSM * 8
+    #          + kMaxSMs*kMaxSlotsPerSM * 4 + kMaxSMs * 4 + 64.
+    v2_size = v1_bytes + 4 * max_sms * max_slots * 8 + 64
+    if total_bytes < v2_size:
+        return out  # v1-only build
+
+    # v2 fields -----------------------------------------------------------
+    slot_body_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    slot_body_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    sync_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    sync_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    out["slot_body_start"] = slot_body_start
+    out["slot_body_end"] = slot_body_end
+    out["sync_start"] = sync_start
+    out["sync_end"] = sync_end
+
+    if total_bytes == v2_size:
+        # Pure v2 build: schema_version sits immediately after sync_end.
+        out["schema_version"] = int(take_i32(1)[0])
+        return out
+
+    # v3 fields (buffer must be ~230 KiB larger than v2) -------------------
+    recv_wait_start = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    recv_wait_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    recv_reduce_end = take_u64(max_sms * max_slots).reshape(max_sms, max_slots)
+    recv_src_rank = take_i32(max_sms * max_slots).reshape(max_sms, max_slots)
+    n_recv_slots = take_i32(max_sms)
+    schema_version = int(take_i32(1)[0])
+    out["recv_wait_start"] = recv_wait_start
+    out["recv_wait_end"] = recv_wait_end
+    out["recv_reduce_end"] = recv_reduce_end
+    out["recv_src_rank"] = recv_src_rank
+    out["n_recv_slots"] = n_recv_slots
+    out["schema_version"] = schema_version
     return out
 
 
@@ -169,16 +200,32 @@ def _probe_summary(probes: list, sm_clock_khz: int) -> dict:
     T_init = []  # slot_body_start - slot_start (mbarrier_init burst)
     T_body = []  # slot_body_end - slot_body_start (pure token pipeline)
     T_sync = []  # sync_end - sync_start (slot-end barrier + finish-flag)
+    # v3 additions — RECV phase. These are the cross-rank critical path.
+    T_recv_wait = []    # recv_wait_end - recv_wait_start (spin on remote flag)
+    T_recv_reduce = []  # recv_reduce_end - recv_wait_end (local work)
+    # Per-SM SEND and RECV totals, used to compute the real critical path:
+    #   T_critical_per_sm = T_send_phase(sm) + T_recv_phase(sm)
+    # then p99 across SMs / iters.
+    per_sm_send = []  # (sm_send_end - sm_send_start) proxied from sm_start to last slot_end
+    per_sm_recv_wait_total = []  # sum of recv waits on an SM
+    per_peer_wait = {}  # src_rank -> list of waits
     schema = 1
     for p in probes:
         n_slots = p["n_slots"]
         max_sms = len(n_slots)
         schema = max(schema, int(p.get("schema_version", 1)))
         has_v2 = schema >= 2 and "slot_body_start" in p
+        has_v3 = schema >= 3 and "recv_wait_start" in p
         for sm in range(max_sms):
             n = int(n_slots[sm])
             if n <= 0:
-                continue
+                # SMs that didn't run SEND may still have RECV data; handle
+                # that by continuing only if neither SEND nor RECV exist.
+                n_recv = 0
+                if has_v3 and "n_recv_slots" in p:
+                    n_recv = int(p["n_recv_slots"][sm])
+                if n_recv <= 0:
+                    continue
             sm_delta = int(p["sm_end"][sm]) - int(p["sm_start"][sm])
             if sm_delta > 0:
                 T_sm.append(sm_delta)
@@ -202,6 +249,23 @@ def _probe_summary(probes: list, sm_clock_khz: int) -> dict:
                         T_body.append(be - bs)
                     if ye > ys > 0:
                         T_sync.append(ye - ys)
+            if has_v3:
+                n_recv = int(p["n_recv_slots"][sm])
+                sm_recv_wait_total = 0
+                for r in range(min(n_recv, p["recv_wait_start"].shape[1])):
+                    ws = int(p["recv_wait_start"][sm, r])
+                    we = int(p["recv_wait_end"][sm, r])
+                    re_ = int(p["recv_reduce_end"][sm, r])
+                    src = int(p["recv_src_rank"][sm, r])
+                    if we > ws > 0:
+                        delta = we - ws
+                        T_recv_wait.append(delta)
+                        sm_recv_wait_total += delta
+                        per_peer_wait.setdefault(src, []).append(delta)
+                    if re_ > we > 0:
+                        T_recv_reduce.append(re_ - we)
+                if sm_recv_wait_total > 0:
+                    per_sm_recv_wait_total.append(sm_recv_wait_total)
     cycles_to_us = 1.0 / (sm_clock_khz * 1000.0) * 1e6
 
     def stats(arr):
@@ -225,7 +289,37 @@ def _probe_summary(probes: list, sm_clock_khz: int) -> dict:
     if schema >= 2:
         out["T_init"] = stats(T_init)
         out["T_body"] = stats(T_body)
+        # IMPORTANT: T_sync measures writer-lane IBGDA RTT, NOT blocking
+        # time on non-writer warps. See docs/PROBE_V3_DESIGN.md. Kept for
+        # backward compatibility but should not be used as an attackable
+        # fraction metric. Analyzers should prefer T_recv_wait below.
         out["T_sync"] = stats(T_sync)
+    if schema >= 3:
+        out["T_recv_wait"] = stats(T_recv_wait)
+        out["T_recv_reduce"] = stats(T_recv_reduce)
+        # critical_path_share: fraction of T_sm consumed by RECV wait on
+        # the same SM. If dominant, any SEND-phase optimization is invisible.
+        # Compute as median(per-SM sum of recv_wait) / median(T_sm).
+        if per_sm_recv_wait_total and T_sm:
+            med_sm = float(np.median(np.asarray(T_sm, dtype=np.int64)))
+            med_recv = float(np.median(
+                np.asarray(per_sm_recv_wait_total, dtype=np.int64)))
+            out["critical_path_share"] = (
+                med_recv / med_sm if med_sm > 0 else None
+            )
+        else:
+            out["critical_path_share"] = None
+        # Per-peer tail signal: which src_rank is the slowest?
+        peer_summary = {}
+        for src, waits in per_peer_wait.items():
+            if waits:
+                a = np.asarray(waits, dtype=np.int64) * cycles_to_us
+                peer_summary[src] = dict(
+                    n=len(a),
+                    p50=float(np.percentile(a, 50)),
+                    p99=float(np.percentile(a, 99)),
+                )
+        out["per_peer_recv_wait"] = peer_summary
     return out
 
 
@@ -764,13 +858,31 @@ def main():
                     continue
                 summary = _probe_summary(probes, sm_clock_khz)
                 schema_version = summary.pop("schema_version", 1)
+                # v3 side-metrics: scalars and per-peer maps are not per-mech
+                # stats, split them out before the loop below.
+                crit_share = summary.pop("critical_path_share", None)
+                peer_map = summary.pop("per_peer_recv_wait", None)
                 if rank == 0:
-                    # One-shot advisory so the host parser knows which v2
+                    # One-shot advisory so the host parser knows which v2/v3
                     # fields to expect. Printing once avoids log bloat.
                     _report(
                         f"PROBE_SCHEMA ntok={ntok} nsms={nsms} "
                         f"version={schema_version}"
                     )
+                    if crit_share is not None:
+                        _report(
+                            f"PROBE_META ntok={ntok} nsms={nsms} "
+                            f"critical_path_share={crit_share:.4f}"
+                        )
+                    if peer_map:
+                        # Compact per-peer line: one entry per src_rank.
+                        peers = " ".join(
+                            f"src{src}:p50={s['p50']:.1f},p99={s['p99']:.1f}"
+                            for src, s in sorted(peer_map.items())
+                        )
+                        _report(
+                            f"PROBE_PEER ntok={ntok} nsms={nsms} {peers}"
+                        )
                 for mech, stats in summary.items():
                     if stats is None:
                         _report(
